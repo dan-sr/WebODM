@@ -55726,6 +55726,7 @@
 			this.scene = null;
 			this._title = args.title || 'No Title';
 			this._description = args.description || '';
+			this._link = args.link || '';
 			this.offset = new Vector3();
 			this.uuid = MathUtils.generateUUID();
 
@@ -55776,16 +55777,36 @@
 
 			this.elTitlebar = this.domElement.find('.annotation-titlebar');
 			this.elTitle = this.elTitlebar.find('.annotation-label');
-			this.elTitle.append(this._title);
+			this.elTitle.text(this._title);
 			this.elDescription = this.domElement.find('.annotation-description');
 			this.elDescriptionClose = this.elDescription.find('.annotation-description-close');
 			// this.elDescriptionContent = this.elDescription.find(".annotation-description-content");
+			this.elLink = this.domElement.find('.annotation-link');
+			this.elLink.text(this._link);
 
 			this.clickTitle = () => {
 				if(this.hasView()){
 					this.moveHere(this.scene.getActiveCamera());
 				}
 				this.dispatchEvent({type: 'click', target: this});
+
+				if (this._link){
+					try{
+						const url = new URL(this._link);
+						if (url.protocol === 'http:' || url.protocol === 'https:'){
+							const isExternal = url.hostname !== window.location.hostname;
+							let proceed = true;
+							if (isExternal) {
+								proceed = confirm(`You are leaving this site to go to ${url.hostname}. Do you want to continue?`);
+							}
+							if (proceed) {
+								window.open(url.toString(), '_blank', 'noopener,noreferrer');
+							}
+						}
+					}catch(err){
+						// pass
+					}
+				}
 			};
 
 			this.elTitle.click(this.clickTitle);
@@ -56059,7 +56080,7 @@
 
 			this._title = title;
 			this.elTitle.empty();
-			this.elTitle.append(this._title);
+			this.elTitle.text(this._title);
 
 			this.dispatchEvent({
 				type: "annotation_changed",
@@ -56080,7 +56101,26 @@
 
 			const elDescriptionContent = this.elDescription.find(".annotation-description-content");
 			elDescriptionContent.empty();
-			elDescriptionContent.append(this._description);
+			elDescriptionContent.text(this._description);
+
+			this.dispatchEvent({
+				type: "annotation_changed",
+				annotation: this,
+			});
+		}
+
+		get link () {
+			return this._link;
+		}
+
+		set link (link) {
+			if (this._link === link) {
+				return;
+			}
+
+			this._link = link;
+			this.elLink.empty();
+			this.elLink.text(this._link);
 
 			this.dispatchEvent({
 				type: "annotation_changed",
@@ -56202,7 +56242,7 @@
 
 				if (this._description) {
 					this.descriptionVisible = true;
-					this.elDescription.fadeIn(200);
+					this.elDescription.fadeIn(1);
 					this.elDescription.css('position', 'relative');
 				}
 			} else {
@@ -56217,6 +56257,7 @@
 		}
 
 		hasView () {
+			if (!this.cameraTarget) return false;
 			let hasPosTargetView = this.cameraTarget.x != null;
 			hasPosTargetView = hasPosTargetView && this.cameraPosition.x != null;
 
@@ -56421,6 +56462,9 @@
 					supported = supported && gl.getExtension('EXT_frag_depth');
 					supported = supported && gl.getParameter(gl.MAX_VARYING_VECTORS) >= 8;
 
+					// EXT_frag_depth is core in WebGL2 (getExtension returns null)
+					supported = supported || (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext);
+
 					return supported;
 				}
 			},
@@ -56431,6 +56475,10 @@
 					supported = supported && gl.getExtension('EXT_frag_depth');
 					supported = supported && gl.getExtension('OES_texture_float');
 					supported = supported && gl.getParameter(gl.MAX_VARYING_VECTORS) >= 8;
+
+					// EXT_frag_depth and OES_texture_float are core in WebGL2
+					// (getExtension returns null for them)
+					supported = supported || (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext);
 
 					return supported;
 				}
@@ -56444,7 +56492,9 @@
 					supported = supported && gl.getExtension('OES_texture_float');
 					supported = supported && gl.getParameter(gl.MAX_VARYING_VECTORS) >= 8;
 
-					//supported = supported || (gl instanceof WebGL2RenderingContext);
+					// EXT_frag_depth and OES_texture_float are core in WebGL2
+					// (getExtension returns null for them)
+					supported = supported || (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext);
 
 					return supported;
 				}
@@ -57591,25 +57641,25 @@
 
 	let Shaders = {};
 
-	Shaders["pointcloud.vs"] = `
+	Shaders["pointcloud.vs"] = `#version 300 es
 precision highp float;
 precision highp int;
 
 #define max_clip_polygons 8
 #define PI 3.141592653589793
 
-attribute vec3 position;
-attribute vec3 color;
-attribute float intensity;
-attribute float classification;
-attribute float returnNumber;
-attribute float numberOfReturns;
-attribute float pointSourceID;
-attribute vec4 indices;
-attribute float spacing;
-attribute float gpsTime;
-attribute vec3 normal;
-attribute float aExtra;
+in vec3 position;
+in vec3 color;
+in float intensity;
+in float classification;
+in float returnNumber;
+in float numberOfReturns;
+in float pointSourceID;
+in vec4 indices;
+in float spacing;
+in float gpsTime;
+in vec3 normal;
+in float aExtra;
 
 uniform mat4 modelMatrix;
 uniform mat4 modelViewMatrix;
@@ -57720,16 +57770,14 @@ uniform mat4 uShadowWorldView[num_shadowmaps];
 uniform mat4 uShadowProj[num_shadowmaps];
 #endif
 
-varying vec3	vColor;
-varying float	vLogDepth;
-varying vec3	vViewPosition;
-varying float 	vRadius;
-varying float 	vPointSize;
+out vec3	vColor;
+out float	vLogDepth;
+out vec3	vViewPosition;
+out float 	vRadius;
+out float 	vPointSize;
 
 
-float round(float number){
-	return floor(number + 0.5);
-}
+// round() is a built-in in GLSL ES 3.00
 
 // 
 //    ###    ########     ###    ########  ######## #### ##     ## ########     ######  #### ######## ########  ######  
@@ -57822,7 +57870,7 @@ float getLOD(){
 		index3d = floor(index3d + 0.5);
 		int index = int(round(4.0 * index3d.x + 2.0 * index3d.y + index3d.z));
 		
-		vec4 value = texture2D(visibleNodes, vec2(float(iOffset) / 2048.0, 0.0));
+		vec4 value = texture(visibleNodes, vec2(float(iOffset) / 2048.0, 0.0));
 		int mask = int(round(value.r * 255.0));
 
 		if(isBitSet(mask, index)){
@@ -57862,7 +57910,7 @@ float getSpacing(){
 		index3d = floor(index3d + 0.5);
 		int index = int(round(4.0 * index3d.x + 2.0 * index3d.y + index3d.z));
 		
-		vec4 value = texture2D(visibleNodes, vec2(float(iOffset) / 2048.0, 0.0));
+		vec4 value = texture(visibleNodes, vec2(float(iOffset) / 2048.0, 0.0));
 		int mask = int(round(value.r * 255.0));
 		float spacingFactor = value.a;
 
@@ -57920,7 +57968,7 @@ float getLOD(){
 		
 	for(float i = 0.0; i <= 1000.0; i++){
 		
-		vec4 value = texture2D(visibleNodes, vec2(iOffset / 2048.0, 0.0));
+		vec4 value = texture(visibleNodes, vec2(iOffset / 2048.0, 0.0));
 		
 		int children = int(value.r * 255.0);
 		float next = value.g * 255.0;
@@ -58017,13 +58065,13 @@ vec3 getGpsTime(){
 	float w = (gpsTime + uGpsOffset) * uGpsScale;
 
 
-	vec3 c = texture2D(gradient, vec2(w, 1.0 - w)).rgb;
+	vec3 c = texture(gradient, vec2(w, 1.0 - w)).rgb;
 
 
 	// vec2 r = uNormalizedGpsBufferRange;
 	// float w = gpsTime * (r.y - r.x) + r.x;
 	// w = clamp(w, 0.0, 1.0);
-	// vec3 c = texture2D(gradient, vec2(w,1.0-w)).rgb;
+	// vec3 c = texture(gradient, vec2(w,1.0-w)).rgb;
 	
 	return c;
 }
@@ -58031,14 +58079,14 @@ vec3 getGpsTime(){
 vec3 getElevation(){
 	vec4 world = modelMatrix * vec4( position, 1.0 );
 	float w = (world.z - elevationRange.x) / (elevationRange.y - elevationRange.x);
-	vec3 cElevation = texture2D(gradient, vec2(w,1.0-w)).rgb;
+	vec3 cElevation = texture(gradient, vec2(w,1.0-w)).rgb;
 	
 	return cElevation;
 }
 
 vec4 getClassification(){
 	vec2 uv = vec2(classification / 255.0, 0.5);
-	vec4 classColor = texture2D(classificationLUT, uv);
+	vec4 classColor = texture(classificationLUT, uv);
 	
 	return classColor;
 }
@@ -58102,14 +58150,14 @@ vec3 getNumberOfReturns(){
 
 	float w = value / 6.0;
 
-	vec3 color = texture2D(gradient, vec2(w, 1.0 - w)).rgb;
+	vec3 color = texture(gradient, vec2(w, 1.0 - w)).rgb;
 
 	return color;
 }
 
 vec3 getSourceID(){
 	float w = mod(pointSourceID, 10.0) / 10.0;
-	return texture2D(gradient, vec2(w,1.0 - w)).rgb;
+	return texture(gradient, vec2(w,1.0 - w)).rgb;
 }
 
 vec3 getCompositeColor(){
@@ -58173,7 +58221,7 @@ vec3 getMatcap(){
 	vec3 r_en = reflect( eye, getNormal() ); // or r_en = e - 2. * dot( n, e ) * n;
 	float m = 2. * sqrt(pow( r_en.x, 2. ) + pow( r_en.y, 2. ) + pow( r_en.z + 1., 2. ));
 	vec2 vN = r_en.xy / m + .5;
-	return texture2D(matcapTextureUniform, vN).rgb; 
+	return texture(matcapTextureUniform, vN).rgb; 
 }
 #endif
 
@@ -58182,7 +58230,7 @@ vec3 getExtra(){
 	float w = (aExtra + uExtraOffset) * uExtraScale;
 	w = clamp(w, 0.0, 1.0);
 
-	vec3 color = texture2D(gradient, vec2(w,1.0-w)).rgb;
+	vec3 color = texture(gradient, vec2(w,1.0-w)).rgb;
 
 	// vec2 r = uExtraNormalizedRange;
 
@@ -58192,7 +58240,7 @@ vec3 getExtra(){
 
 	// w = clamp(w, 0.0, 1.0);
 
-	// vec3 color = texture2D(gradient, vec2(w,1.0-w)).rgb;
+	// vec3 color = texture(gradient, vec2(w,1.0-w)).rgb;
 
 	return color;
 }
@@ -58219,13 +58267,13 @@ vec3 getColor(){
 		color = getGpsTime();
 	#elif defined color_type_intensity_gradient
 		float w = getIntensity();
-		color = texture2D(gradient, vec2(w,1.0-w)).rgb;
+		color = texture(gradient, vec2(w,1.0-w)).rgb;
 	#elif defined color_type_color
 		color = uColor;
 	#elif defined color_type_level_of_detail
 		float depth = getLOD();
 		float w = depth / 10.0;
-		color = texture2D(gradient, vec2(w,1.0-w)).rgb;
+		color = texture(gradient, vec2(w,1.0-w)).rgb;
 	#elif defined color_type_indices
 		color = indices.rgb;
 	#elif defined color_type_classification
@@ -58533,7 +58581,7 @@ void main() {
 
 			if(distance < 1.0){
 				float w = distance;
-				vec3 cGradient = texture2D(gradient, vec2(w, 1.0 - w)).rgb;
+				vec3 cGradient = texture(gradient, vec2(w, 1.0 - w)).rgb;
 				
 				vColor = cGradient;
 				//vColor = cGradient * 0.7 + vColor * 0.3;
@@ -58575,7 +58623,7 @@ void main() {
 			float bias = vRadius * 2.0;
 
 			for(int j = 0; j < 9; j++){
-				vec4 depthMapValue = texture2D(uShadowMap[i], vec2(u, v) + sampleLocations[j]);
+				vec4 depthMapValue = texture(uShadowMap[i], vec2(u, v) + sampleLocations[j]);
 
 				float linearDepthFromSM = depthMapValue.x + bias;
 				float linearDepthFromViewer = distanceToLight;
@@ -58603,13 +58651,11 @@ void main() {
 }
 `;
 
-	Shaders["pointcloud.fs"] = `
-#if defined paraboloid_point_shape
-	#extension GL_EXT_frag_depth : enable
-#endif
-
+	Shaders["pointcloud.fs"] = `#version 300 es
 precision highp float;
 precision highp int;
+
+out vec4 fragColor;
 
 uniform mat4 viewMatrix;
 uniform mat4 uViewInv;
@@ -58630,19 +58676,19 @@ uniform float uPCIndex;
 uniform float uScreenWidth;
 uniform float uScreenHeight;
 
-varying vec3	vColor;
-varying float	vLogDepth;
-varying vec3	vViewPosition;
-varying float	vRadius;
-varying float 	vPointSize;
-varying vec3 	vPosition;
+in vec3	vColor;
+in float	vLogDepth;
+in vec3	vViewPosition;
+in float	vRadius;
+in float 	vPointSize;
+in vec3 	vPosition;
 
 
 float specularStrength = 1.0;
 
 void main() {
 
-	// gl_FragColor = vec4(vColor, 1.0);
+	// fragColor = vec4(vColor, 1.0);
 
 	vec3 color = vColor;
 	float depth = gl_FragCoord.z;
@@ -58660,9 +58706,9 @@ void main() {
 	#endif
 		
 	#if defined color_type_indices
-		gl_FragColor = vec4(color, uPCIndex / 255.0);
+		fragColor = vec4(color, uPCIndex / 255.0);
 	#else
-		gl_FragColor = vec4(color, uOpacity);
+		fragColor = vec4(color, uOpacity);
 	#endif
 
 	#if defined paraboloid_point_shape
@@ -58674,7 +58720,7 @@ void main() {
 		pos = pos / pos.w;
 		float expDepth = pos.z;
 		depth = (pos.z + 1.0) / 2.0;
-		gl_FragDepthEXT = depth;
+		gl_FragDepth = depth;
 		
 		#if defined(color_type_depth)
 			color.r = linearDepth;
@@ -58682,12 +58728,12 @@ void main() {
 		#endif
 		
 		#if defined(use_edl)
-			gl_FragColor.a = log2(linearDepth);
+			fragColor.a = log2(linearDepth);
 		#endif
 		
 	#else
 		#if defined(use_edl)
-			gl_FragColor.a = vLogDepth;
+			fragColor.a = vLogDepth;
 		#endif
 	#endif
 
@@ -58696,11 +58742,11 @@ void main() {
 		float weight = max(0.0, 1.0 - distance);
 		weight = pow(weight, 1.5);
 
-		gl_FragColor.a = weight;
-		gl_FragColor.xyz = gl_FragColor.xyz * weight;
+		fragColor.a = weight;
+		fragColor.xyz = fragColor.xyz * weight;
 	#endif
 
-	//gl_FragColor = vec4(0.0, 0.7, 0.0, 1.0);
+	//fragColor = vec4(0.0, 0.7, 0.0, 1.0);
 	
 }
 
@@ -58874,13 +58920,13 @@ void main() {
 precision mediump float;
 precision mediump int;
 
-attribute vec3 position;
-attribute vec2 uv;
+in vec3 position;
+in vec2 uv;
 
 uniform mat4 projectionMatrix;
 uniform mat4 modelViewMatrix;
 
-varying vec2 vUv;
+out vec2 vUv;
 
 void main() {
 	vUv = uv;
@@ -58888,39 +58934,37 @@ void main() {
 }`;
 
 	Shaders["normalize.fs"] = `
-#extension GL_EXT_frag_depth : enable
-
 precision mediump float;
 precision mediump int;
 
 uniform sampler2D uWeightMap;
 uniform sampler2D uDepthMap;
 
-varying vec2 vUv;
+in vec2 vUv;
+
+out vec4 fragColor;
 
 void main() {
-	float depth = texture2D(uDepthMap, vUv).r;
-	
+	float depth = texture(uDepthMap, vUv).r;
+
 	if(depth >= 1.0){
 		discard;
 	}
 
-	gl_FragColor = vec4(depth, 1.0, 0.0, 1.0);
+	fragColor = vec4(depth, 1.0, 0.0, 1.0);
 
-	vec4 color = texture2D(uWeightMap, vUv); 
+	vec4 color = texture(uWeightMap, vUv);
 	color = color / color.w;
-	
-	gl_FragColor = vec4(color.xyz, 1.0); 
-	
-	gl_FragDepthEXT = depth;
+
+	fragColor = vec4(color.xyz, 1.0);
+
+	gl_FragDepth = depth;
 
 
 }`;
 
 	Shaders["normalize_and_edl.fs"] = `
-#extension GL_EXT_frag_depth : enable
-
-// 
+//
 // adapted from the EDL shader code from Christian Boucheny in cloud compare:
 // https://github.com/cloudcompare/trunk/tree/master/plugins/qEDL/shaders/EDL
 //
@@ -58938,17 +58982,19 @@ uniform vec2 neighbours[NEIGHBOUR_COUNT];
 uniform float edlStrength;
 uniform float radius;
 
-varying vec2 vUv;
+in vec2 vUv;
+
+out vec4 fragColor;
 
 float response(float depth){
 	vec2 uvRadius = radius / vec2(screenWidth, screenHeight);
-	
+
 	float sum = 0.0;
-	
+
 	for(int i = 0; i < NEIGHBOUR_COUNT; i++){
 		vec2 uvNeighbor = vUv + uvRadius * neighbours[i];
-		
-		float neighbourDepth = texture2D(uEDLMap, uvNeighbor).a;
+
+		float neighbourDepth = texture(uEDLMap, uvNeighbor).a;
 
 		if(neighbourDepth != 0.0){
 			if(depth == 0.0){
@@ -58958,54 +59004,52 @@ float response(float depth){
 			}
 		}
 	}
-	
+
 	return sum / float(NEIGHBOUR_COUNT);
 }
 
 void main() {
 
-	float edlDepth = texture2D(uEDLMap, vUv).a;
+	float edlDepth = texture(uEDLMap, vUv).a;
 	float res = response(edlDepth);
 	float shade = exp(-res * 300.0 * edlStrength);
 
-	float depth = texture2D(uDepthMap, vUv).r;
+	float depth = texture(uDepthMap, vUv).r;
 	if(depth >= 1.0 && res == 0.0){
 		discard;
 	}
-	
-	vec4 color = texture2D(uWeightMap, vUv); 
+
+	vec4 color = texture(uWeightMap, vUv);
 	color = color / color.w;
 	color = color * shade;
 
-	gl_FragColor = vec4(color.xyz, 1.0); 
+	fragColor = vec4(color.xyz, 1.0);
 
-	gl_FragDepthEXT = depth;
+	gl_FragDepth = depth;
 }`;
 
 	Shaders["edl.vs"] = `
 precision mediump float;
 precision mediump int;
 
-attribute vec3 position;
-attribute vec2 uv;
+in vec3 position;
+in vec2 uv;
 
 uniform mat4 projectionMatrix;
 uniform mat4 modelViewMatrix;
 
-varying vec2 vUv;
+out vec2 vUv;
 
 void main() {
 	vUv = uv;
-	
+
 	vec4 mvPosition = modelViewMatrix * vec4(position,1.0);
 
 	gl_Position = projectionMatrix * mvPosition;
 }`;
 
 	Shaders["edl.fs"] = `
-#extension GL_EXT_frag_depth : enable
-
-// 
+//
 // adapted from the EDL shader code from Christian Boucheny in cloud compare:
 // https://github.com/cloudcompare/trunk/tree/master/plugins/qEDL/shaders/EDL
 //
@@ -59028,17 +59072,19 @@ uniform mat4 uProj;
 uniform sampler2D uEDLColor;
 uniform sampler2D uEDLDepth;
 
-varying vec2 vUv;
+in vec2 vUv;
+
+out vec4 fragColor;
 
 float response(float depth){
 	vec2 uvRadius = radius / vec2(screenWidth, screenHeight);
-	
+
 	float sum = 0.0;
-	
+
 	for(int i = 0; i < NEIGHBOUR_COUNT; i++){
 		vec2 uvNeighbor = vUv + uvRadius * neighbours[i];
-		
-		float neighbourDepth = texture2D(uEDLColor, uvNeighbor).a;
+
+		float neighbourDepth = texture(uEDLColor, uvNeighbor).a;
 		neighbourDepth = (neighbourDepth == 1.0) ? 0.0 : neighbourDepth;
 
 		if(neighbourDepth != 0.0){
@@ -59049,19 +59095,26 @@ float response(float depth){
 			}
 		}
 	}
-	
+
 	return sum / float(NEIGHBOUR_COUNT);
 }
 
 void main(){
-	vec4 cEDL = texture2D(uEDLColor, vUv);
-	
+	// Fully transparent: don't write color nor depth values
+	// (the point cloud might be hidden to display other models,
+	// e.g. gaussian splats, that render into the same buffers)
+	if(opacity == 0.0){
+		discard;
+	}
+
+	vec4 cEDL = texture(uEDLColor, vUv);
+
 	float depth = cEDL.a;
 	depth = (depth == 1.0) ? 0.0 : depth;
 	float res = response(depth);
 	float shade = exp(-res * 300.0 * edlStrength);
 
-	gl_FragColor = vec4(cEDL.rgb * shade, opacity);
+	fragColor = vec4(cEDL.rgb * shade, opacity);
 
 	{ // write regular hyperbolic depth values to depth buffer
 		float dl = pow(2.0, depth);
@@ -59070,7 +59123,7 @@ void main(){
 		float pz = dp.z / dp.w;
 		float fragDepth = (pz + 1.0) / 2.0;
 
-		gl_FragDepthEXT = fragDepth;
+		gl_FragDepth = fragDepth;
 	}
 
 	if(depth == 0.0){
@@ -64557,6 +64610,7 @@ void main() {
 			uuid: annotation.uuid,
 			title: annotation.title.toString(),
 			description: annotation.description,
+			link: annotation.link,
 			position: annotation.position.toArray(),
 			offset: annotation.offset.toArray(),
 			children: [],
@@ -65428,6 +65482,7 @@ void main() {
 
 
 		annotation.description = item.description;
+		annotation.link = item.link;
 		annotation.uuid = item.uuid;
 
 		if(item.offset){
@@ -65608,7 +65663,7 @@ void main() {
 		}
 
 		getDefines() {
-			let defines = '';
+			let defines = '#version 300 es\n';
 
 			defines += '#define NEIGHBOUR_COUNT ' + this.neighbourCount + '\n';
 
@@ -65676,7 +65731,7 @@ void main() {
 		}
 
 		getDefines() {
-			let defines = '';
+			let defines = '#version 300 es\n';
 
 			defines += '#define NEIGHBOUR_COUNT ' + this.neighbourCount + '\n';
 
@@ -65735,7 +65790,7 @@ void main() {
 		}
 
 		getDefines() {
-			let defines = '';
+			let defines = '#version 300 es\n';
 
 			return defines;
 		}
@@ -72080,7 +72135,7 @@ void main() {
 					let coordinates = feature.getGeometry().getCoordinates();
 					let p = this.map.getPixelFromCoordinate(coordinates);
 
-					this.elTooltip.html(annotation.title);
+					this.elTooltip.text(annotation.title);
 					this.elTooltip.css('display', '');
 					this.elTooltip.css('left', `${p[0]}px`);
 					this.elTooltip.css('top', `${p[1]}px`);
@@ -75428,7 +75483,9 @@ ENDSEC
 						Can be multiple lines long. TODO: the user should be able
 						to modify title and description. 
 				</div>
-
+				
+				<div class="heading">Link</div>
+				<div id="annotation_link" contenteditable="true"></div>
 			</div>
 
 		</div>
@@ -75445,18 +75502,25 @@ ENDSEC
 						{duration: 3000});
 			});
 
-			this.elTitle = this.elContent.find("#annotation_title").html(annotation.title);
-			this.elDescription = this.elContent.find("#annotation_description").html(annotation.description);
+			this.elTitle = this.elContent.find("#annotation_title").text(annotation.title);
+			this.elDescription = this.elContent.find("#annotation_description").text(annotation.description);
+			this.elLink = this.elContent.find("#annotation_link").text(annotation.link);
+			
 
 			this.elTitle[0].addEventListener("input", () => {
-				const title = this.elTitle.html();
+				const title = this.elTitle.text();
 				annotation.title = title;
 
 			}, false);
 
 			this.elDescription[0].addEventListener("input", () => {
-				const description = this.elDescription.html();
+				const description = this.elDescription.text();
 				annotation.description = description;
+			}, false);
+
+			this.elLink[0].addEventListener("input", () => {
+				const link = this.elLink.text();
+				annotation.link = link;
 			}, false);
 
 			this.update();
@@ -75470,10 +75534,8 @@ ENDSEC
 			elContent.find("#annotation_position_y").html(pos[1]);
 			elContent.find("#annotation_position_z").html(pos[2]);
 
-			elTitle.html(annotation.title);
-			elDescription.html(annotation.description);
-
-
+			elTitle.text(annotation.title);
+			elDescription.text(annotation.description);
 		}
 	};
 
@@ -79243,7 +79305,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/angle.png',
 				'[title]tt.angle_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: false,
 						showAngles: true,
@@ -79264,7 +79326,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/point.svg',
 				'[title]tt.point_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: false,
 						showAngles: false,
@@ -79286,7 +79348,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/distance.svg',
 				'[title]tt.distance_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: true,
 						showArea: false,
@@ -79305,7 +79367,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/height.svg',
 				'[title]tt.height_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: false,
 						showHeight: true,
@@ -79326,7 +79388,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/circle.svg',
 				'[title]tt.circle_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: false,
 						showHeight: false,
@@ -79349,7 +79411,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/azimuth.svg',
 				'Azimuth',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: false,
 						showHeight: false,
@@ -79373,7 +79435,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/area.svg',
 				'[title]tt.area_measurement',
 				() => {
-					$('#menu_measurements').next().slideDown();
+					$('#menu_measurements').next().show();
 					let measurement = this.measuringTool.startInsertion({
 						showDistances: true,
 						showArea: true,
@@ -79420,7 +79482,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/profile.svg',
 				'[title]tt.height_profile',
 				() => {
-					$('#menu_measurements').next().slideDown(); ;
+					$('#menu_measurements').next().show(); ;
 					let profile = this.profileTool.startInsertion();
 
 					let measurementsRoot = $("#jstree_scene").jstree().get_json("measurements");
@@ -79435,7 +79497,7 @@ ENDSEC
 				Potree.resourcePath + '/icons/annotation.svg',
 				'[title]tt.annotation',
 				() => {
-					$('#menu_measurements').next().slideDown(); ;
+					$('#menu_measurements').next().show(); ;
 					let annotation = this.viewer.annotationTool.startInsertion();
 
 					let annotationsRoot = $("#jstree_scene").jstree().get_json("annotations");
@@ -79714,6 +79776,11 @@ ENDSEC
 
 				if(object){
 					object.visible = false;
+				}else {
+					// Root node: uncheck all children
+					data.node.children.forEach(childId => {
+						tree.jstree('uncheck_node', childId);
+					});
 				}
 			});
 
@@ -79722,6 +79789,11 @@ ENDSEC
 
 				if(object){
 					object.visible = true;
+				}else {
+					// Root node: check all children
+					data.node.children.forEach(childId => {
+						tree.jstree('check_node', childId);
+					});
 				}
 			});
 
@@ -79766,19 +79838,30 @@ ENDSEC
 				createNode(measurementID, profile.name, icon, profile);
 			};
 
+			let escapeHTML = (str) => {
+				return str.replace(/[&<>"']/g, function(m) {
+					return {
+					'&': '&amp;',
+					'<': '&lt;',
+					'>': '&gt;',
+					'"': '&quot;',
+					"'": '&#39;'
+					}[m];
+				});
+			};
+
 			let onAnnotationAdded = (e) => {
 				let annotation = e.annotation;
 
 				let annotationIcon = `${Potree.resourcePath}/icons/annotation.svg`;
 				let parentID = this.annotationMapping.get(annotation.parent);
-				let annotationID = createNode(parentID, annotation.title, annotationIcon, annotation);
+				let annotationID = createNode(parentID, escapeHTML(annotation.title), annotationIcon, annotation);
 				this.annotationMapping.set(annotation, annotationID);
 
 				annotation.addEventListener("annotation_changed", (e) => {
 					let annotationsRoot = $("#jstree_scene").jstree().get_json("annotations");
 					let jsonNode = annotationsRoot.children.find(child => child.data.uuid === annotation.uuid);
-					
-					$.jstree.reference(jsonNode.id).rename_node(jsonNode.id, annotation.title);
+					$.jstree.reference(jsonNode.id).rename_node(jsonNode.id, escapeHTML(annotation.title));
 				});
 			};
 
@@ -80414,7 +80497,7 @@ ENDSEC
 				content.hide();
 
 				header.click(() => {
-					content.slideToggle();
+					content.toggle();
 				});
 			});
 
@@ -89412,7 +89495,7 @@ ENDSEC
 
 			let canvas = document.createElement("canvas");
 
-			let context = canvas.getContext('webgl', contextAttributes );
+			let context = canvas.getContext('webgl2', contextAttributes );
 
 			this.renderer = new WebGLRenderer({
 				alpha: true, 

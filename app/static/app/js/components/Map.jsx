@@ -12,12 +12,14 @@ import $ from 'jquery';
 import ErrorMessage from './ErrorMessage';
 import ImagePopup from './ImagePopup';
 import GCPPopup from './GCPPopup';
+import MediaView from './MediaView';
 import SwitchModeButton from './SwitchModeButton';
 import ShareButton from './ShareButton';
-import {addTempLayer} from '../classes/TempLayer';
+import {addOverlayLayer, buildOverlay, recomputeOverlayBounds} from '../classes/OverlayLayer';
+import FormDialog from './FormDialog';
 import PropTypes from 'prop-types';
 import PluginsAPI from '../classes/plugins/API';
-import Basemaps from '../classes/Basemaps';
+
 import Standby from './Standby';
 import LayersControl from './LayersControl';
 import AssetDownloadButtons from './AssetDownloadButtons';
@@ -25,11 +27,10 @@ import CropButton from './CropButton';
 import update from 'immutability-helper';
 import ColorMaps from '../classes/ColorMaps';
 import Utils from '../classes/Utils';
-import '../vendor/leaflet/Leaflet.Ajax';
 import 'rbush';
 import '../vendor/leaflet/leaflet-markers-canvas';
 import '../vendor/leaflet/Leaflet.SideBySide/leaflet-side-by-side';
-import { _ } from '../classes/gettext';
+import { _, interpolate } from '../classes/gettext';
 import UnitSelector from './UnitSelector';
 import { unitSystem, toMetric } from '../classes/Units';
 
@@ -43,7 +44,8 @@ class Map extends React.Component {
     publicEdit: false,
     shareButtons: true,
     permissions: ["view"],
-    thermal: false
+    thermal: false,
+    basemaps: []
   };
 
   static propTypes = {
@@ -55,7 +57,8 @@ class Map extends React.Component {
     shareButtons: PropTypes.bool,
     permissions: PropTypes.array,
     thermal: PropTypes.bool,
-    project: PropTypes.object
+    project: PropTypes.object,
+    basemaps: PropTypes.array
   };
 
   constructor(props) {
@@ -70,14 +73,21 @@ class Map extends React.Component {
       imageryLayers: [],
       overlays: [],
       annotations: [],
+      userOverlays: [],
       rightLayers: []
     };
 
     this.basemaps = {};
     this.mapBounds = null;
+    this.overlayUploadCount = 0;
+    this.pendingDxfFile = null;
+    this.pendingDxfTask = null;
+    this.serverStamp = null;
+    this.clientStamp = null;
     this.autolayers = null;
     this.taskCount = 1;
     this.addedCameraShots = {};
+    this.addedMediaLayer = {};
     this.zIndexGroupMap = {};
     this.ious = {};
 
@@ -107,7 +117,11 @@ class Map extends React.Component {
 
   tdPopupButtonUrl = (task) => {
     if (this.props.public){
-      return `/public/task/${task.id}/3d/`;
+      if (location.href.indexOf("/iframe/") !== -1){
+        return `/public/task/${task.id}/iframe/3d/`;
+      }else{
+        return `/public/task/${task.id}/3d/`;
+      }
     }else{
       return `/3d/project/${task.project}/task/${task.id}/`;
     }
@@ -313,15 +327,23 @@ class Map extends React.Component {
                     if (type === 'plant'){
                       // percentile
                       for (let b in statistics){
-                        min = Math.min(statistics[b]["percentiles"][0]);
-                        max = Math.max(statistics[b]["percentiles"][1]);
+                        min = Math.min(min, statistics[b]["percentiles"][0]);
+                        max = Math.max(max, statistics[b]["percentiles"][1]);
                       }
                     }else{
-                      // min/max
-                      for (let b in statistics){
-                        min = Math.min(statistics[b]["min"]);
-                        max = Math.max(statistics[b]["max"]);
+                      let bandsIdx = Object.keys(statistics);
+                      const rgb = ["red", "green", "blue"];
+                      
+                      // Limit search for min/max to RGB channels only (better display)
+                      if (type === 'orthophoto' && this.hasBands(rgb, meta.task.orthophoto_bands)){
+                        bandsIdx = rgb.map(d => String(meta.task.orthophoto_bands.map(ob => (ob.description || "").toLowerCase()).indexOf(d) + 1));
                       }
+
+                      // min/max
+                      bandsIdx.forEach(b => {
+                        min = Math.min(min, statistics[b]["min"]);
+                        max = Math.max(max, statistics[b]["max"]);
+                      });
                     }
                     params.rescale = encodeURIComponent(`${min},${max}`);              
                 }else{
@@ -454,6 +476,84 @@ class Map extends React.Component {
             let mapBounds = this.mapBounds || Leaflet.latLngBounds();
             mapBounds.extend(bounds);
             this.mapBounds = mapBounds;
+
+            // Add media layer if available
+            if (meta.task && meta.task.media && !this.addedMediaLayer[meta.task.id]){
+                const mediaTypes = ['photo', 'pano', 'video'];
+                const mediaIcons = mediaTypes.reduce((obj, type) => {
+                  obj[type] = L.icon({
+                    iconUrl: `/static/app/js/icons/marker-media-${type}.png`,
+                    iconSize: [41, 46],
+                    iconAnchor: [17, 46],
+                  })
+                  return obj;
+                }, {});
+                  
+                const mediaLayer = new L.MarkersCanvas();
+                
+                mediaLayer.lazyLoad = (cb) => {
+                  $.getJSON(meta.task.media)
+                    .done((geojson) => {
+                      if (geojson.type === 'FeatureCollection'){
+                        let markers = [];
+  
+                        geojson.features.forEach(s => {
+                          if (!s.properties) return;
+                          if (mediaTypes.indexOf(s.properties.type) === -1) return;
+
+                          let marker = L.marker(
+                            [s.geometry.coordinates[1], s.geometry.coordinates[0]],
+                            { icon: mediaIcons[s.properties.type] }
+                          );
+                          markers.push(marker);
+
+                          marker.on('click', (e) => {
+                            const basePath = `/api/projects/${meta.task.project}/tasks/${meta.task.id}/media`;
+
+                            if (s.properties.type === 'video' && s.properties.srt) {
+                              this.openVideoWithFlightPath(basePath, s.properties, marker, mediaLayer);
+                              return;
+                            }
+
+                            const container = document.createElement('div');
+                            ReactDOM.render(<MediaView
+                              basePath={basePath}
+                              media={s.properties}
+                              autoOpen
+                              onClose={() => {
+                                ReactDOM.unmountComponentAtNode(container);
+                                container.remove();
+                                this.map.closePopup();
+                              }}
+                            />, container);
+                            document.body.appendChild(container);
+                          });
+
+                        });
+  
+                        mediaLayer.addMarkers(markers, this.map);
+                      }
+                      cb();
+                    }).fail(() => {
+                      cb(new Error("Cannot load media markers"))
+                    });
+                };
+                mediaLayer[Symbol.for("meta")] = {
+                  name: _("Media"), 
+                  icon: "fa fa-image fa-fw",
+                  zIndexGroup
+                };
+                if (this.taskCount > 1){
+                  // Assign to a group
+                  mediaLayer[Symbol.for("meta")].group = {id: meta.task.id, name: meta.task.name};
+                }
+
+                this.setState(update(this.state, {
+                    overlays: {$push: [mediaLayer]}
+                }));
+
+                this.addedMediaLayer[meta.task.id] = true;
+            }
 
             // Add camera shots layer if available
             if (meta.task && meta.task.camera_shots && !this.addedCameraShots[meta.task.id]){
@@ -657,32 +757,46 @@ class Map extends React.Component {
 
     if (showBackground) {
       this.basemaps = {};
-      
-      Basemaps.forEach((src, idx) => {
-        const { url, ...props } = src;
-        const tileProps = Utils.clone(props);
-        tileProps.maxNativeZoom = tileProps.maxZoom;
-        tileProps.maxZoom = tileProps.maxZoom + 99;
-        const layer = L.tileLayer(url, tileProps);
+      const basemaps = this.props.basemaps;
+      if (basemaps.length > 0) {
+        basemaps.forEach(bm => {
+          let layer;
+          const opts = {
+            layers: bm.layers || '0',
+            styles: bm.styles || 'default',
+            format: bm.format || 'image/png',
+            transparent: (bm.format || 'image/png') == 'image/png',
+            attribution: bm.attribution || bm.label,
+            maxZoom: (bm.maxzoom || 21) + 99,
+            maxNativeZoom: bm.maxzoom || 21,
+            minZoom: bm.minzoom || 0,
+            subdomains: bm.subdomains || [],
+          }
+          if (bm.type === 'wms') {
+            layer = L.tileLayer.wms(bm.url, opts);
+          } else {
+            layer = L.tileLayer(bm.url, opts);
+          }
 
-        if (idx === 0) {
-          layer.addTo(this.map);
-        }
+          if (bm['default']) {
+            layer.addTo(this.map);
+          }
 
-        this.basemaps[props.label] = layer;
-      });
+          this.basemaps[bm.label] = layer;
+        });
+      }
 
       const customLayer = L.layerGroup();
       customLayer.on("add", a => {
         const defaultCustomBm = window.localStorage.getItem('lastCustomBasemap') || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-      
+
         let url = window.prompt([_('Enter a tile URL template. Valid coordinates are:'),
 _('{z}, {x}, {y} for Z/X/Y tile scheme'),
-_('{-y} for flipped TMS-style Y coordinates'),
+_('{−y} for flipped TMS-style Y coordinates'),
 '',
 _('Example:'),
 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'].join("\n"), defaultCustomBm);
-        
+
         if (url){
           customLayer.clearLayers();
           const l = L.tileLayer(url, {
@@ -694,7 +808,7 @@ _('Example:'),
           l.bringToBack();
           window.localStorage.setItem('lastCustomBasemap', url);
         }
-      });
+     });
       this.basemaps[_("Custom")] = customLayer;
       this.basemaps[_("None")] = L.layerGroup();
     }
@@ -702,7 +816,8 @@ _('Example:'),
     this.layersControl = new LayersControl({
         layers: this.state.imageryLayers,
         overlays: this.state.overlays,
-        annotations: this.state.annotations
+        annotations: this.state.annotations,
+        onUserOverlayRemove: this.removeUserOverlay
     }).addTo(this.map);
 
     this.autolayers = Leaflet.control.autolayers({
@@ -713,27 +828,42 @@ _('Example:'),
 
     // Drag & Drop overlays
     const addDnDZone = (container, opts) => {
-        const mapTempLayerDrop = new Dropzone(container, opts);
-        mapTempLayerDrop.on("addedfile", (file) => {
+        const mapOverlayLayerDrop = new Dropzone(container, opts);
+        mapOverlayLayerDrop.on("addedfile", (file) => {
+          if (/\.dxf$/i.test(file.name)){
+            mapOverlayLayerDrop.removeFile(file);
+            this.handleDxfDrop(file);
+            return;
+          }
+
+          // Zipped shapefiles are converted server-side
+          if (/\.zip$/i.test(file.name)){
+            mapOverlayLayerDrop.removeFile(file);
+            if (this.checkOverlayTask()) this.uploadOverlay(file, null, this.getNearestTask());
+            return;
+          }
+
           this.setState({showLoading: true});
-          addTempLayer(file, (err, tempLayer, filename) => {
+          addOverlayLayer(file, (err, entry, geojson) => {
             if (!err){
-              tempLayer.addTo(this.map);
-              tempLayer[Symbol.for("meta")] = {name: filename};
+              this.assignOverlayTask(entry, this.getNearestTask());
+              entry.children.forEach(c => c.layer.addTo(this.map));
               this.setState(update(this.state, {
-                 overlays: {$push: [tempLayer]}
+                 userOverlays: {$push: [entry]}
               }));
+              if (this.layersControl) this.layersControl.openPanel();
               //zoom to all features
-              this.map.fitBounds(tempLayer.getBounds());
+              if (entry.bounds.isValid()) this.map.fitBounds(entry.bounds);
+              this.storeOverlay(entry, geojson);
             }else{
               this.setState({ error: err.message || JSON.stringify(err) });
             }
-    
+
             this.setState({showLoading: false});
           });
         });
-        mapTempLayerDrop.on("error", (file) => {
-          mapTempLayerDrop.removeFile(file);
+        mapOverlayLayerDrop.on("error", (file) => {
+          mapOverlayLayerDrop.removeFile(file);
         });
     };
 
@@ -748,7 +878,7 @@ _('Example:'),
             this.container = Leaflet.DomUtil.create('div', 'leaflet-control-add-overlay leaflet-bar leaflet-control');
             Leaflet.DomEvent.disableClickPropagation(this.container);
             const btn = Leaflet.DomUtil.create('a', 'leaflet-control-add-overlay-button');
-            btn.setAttribute("title", _("Add a temporary GeoJSON (.json) or ShapeFile (.zip) overlay"));
+            btn.setAttribute("title", _("Add a GeoJSON (.json), ShapeFile (.zip) or AutoCAD (.dxf) overlay"));
             
             this.container.append(btn);
             addDnDZone(btn, {url: "/", clickable: true});
@@ -859,6 +989,7 @@ _('Example:'),
     this.loadImageryLayers(true).then(() => {
         this.setState({showLoading: false});
         this.map.fitBounds(this.mapBounds);
+        this.loadStoredOverlays();
 
         this.map.on('click', e => {
           if (PluginsAPI.Map.handleClick(e)) return;
@@ -1006,6 +1137,357 @@ _('Example:'),
     }
   }
 
+  checkOverlayTask = () => {
+    if (!this.props.tiles.length){
+      this.setState({error: _("Cannot import overlay: no task is loaded.")});
+      return false;
+    }
+    return true;
+  }
+
+  // Find the task closest to the current map center
+  // by looking at the bounds of the tasks' imagery layers
+  getNearestTask = () => {
+    if (!this.props.tiles.length) return null;
+    if (this.taskCount === 1) return this.props.tiles[0].meta.task;
+
+    let candidates = this.state.imageryLayers.filter(l => {
+      const meta = l[Symbol.for("meta")] || {};
+      return meta.task && l.options.bounds;
+    });
+    if (!candidates.length) return this.props.tiles[0].meta.task;
+
+    const visible = candidates.filter(l => l._map && !l.isHidden());
+    if (visible.length) candidates = visible;
+
+    const center = this.map.getCenter();
+    const zIndexOf = l => (l[Symbol.for("meta")].zIndexGroup || 1);
+
+    // Topmost layer containing the center
+    const containing = candidates.filter(l => l.options.bounds.contains(center));
+    if (containing.length){
+      return containing.sort((a, b) => zIndexOf(b) - zIndexOf(a))[0][Symbol.for("meta")].task;
+    }
+
+    // Otherwise, nearest bounds
+    const distanceTo = l => {
+      const bounds = l.options.bounds;
+      const closest = L.latLng(
+        Math.min(Math.max(center.lat, bounds.getSouth()), bounds.getNorth()),
+        Math.min(Math.max(center.lng, bounds.getWest()), bounds.getEast())
+      );
+      return center.distanceTo(closest);
+    };
+    return candidates.sort((a, b) => (distanceTo(a) - distanceTo(b)) || (zIndexOf(b) - zIndexOf(a)))[0][Symbol.for("meta")].task;
+  }
+
+  assignOverlayTask = (entry, task) => {
+    entry.task = task;
+    if (this.taskCount > 1 && task){
+      entry.group = {id: task.id, name: task.name};
+    }
+  }
+
+  canEditTask = () => {
+    return this.props.permissions.indexOf("change") !== -1 || (this.props.public && this.props.publicEdit);
+  }
+
+  overlayMeta = entry => {
+    return {
+      opacity: entry.opacity,
+      visible: entry.visible !== false,
+      colors: entry.children.reduce((obj, c) => { obj[c.name] = c.colorKey; return obj; }, {}),
+      hidden: entry.children.filter(c => c.visible === false).map(c => c.name)
+    };
+  }
+
+  overlayUrl = (entry, overlayId = "") => {
+    return `/api/projects/${entry.task.project}/tasks/${entry.task.id}/overlays/${overlayId ? overlayId + ".geojson" : "sync"}`;
+  }
+
+  storeOverlay = (entry, geojson) => {
+    if (!this.canEditTask() || !entry.task) return;
+
+    const formData = new FormData();
+    formData.append("file", new Blob([JSON.stringify(geojson)], {type: "application/json"}), entry.name + ".geojson");
+    formData.append("name", entry.name);
+    formData.append("meta", JSON.stringify(this.overlayMeta(entry)));
+
+    entry.syncing = true;
+    this.setState({userOverlays: this.state.userOverlays.slice()});
+
+    $.ajax({
+      url: this.overlayUrl(entry),
+      type: 'POST',
+      data: formData,
+      processData: false,
+      contentType: false
+    }).done(res => {
+      entry.storageId = res.id;
+      entry.stored = true;
+      this.setOverlaySync(entry);
+    }).fail(() => {
+      this.setState({error: interpolate(_("Cannot save overlay %(name)s"), {name: entry.name})});
+    }).always(() => {
+      entry.syncing = false;
+      this.setState({userOverlays: this.state.userOverlays.slice()});
+    });
+  }
+
+  setOverlaySync = entry => {
+    entry.onSync = e => {
+      if (e._syncTimeout) clearTimeout(e._syncTimeout);
+      e._syncTimeout = setTimeout(() => this.patchOverlay(e), 500);
+    };
+  }
+
+  patchOverlay = (entry, extra = {}) => {
+    if (!entry.storageId || !entry.task || !this.canEditTask()) return;
+
+    // Stamps are in the server's clock domain: fetch server time once,
+    // then derive subsequent stamps from the elapsed client time
+    if (!this.serverStamp){
+      $.ajax({
+        type: 'GET',
+        url: `/api/projects/${entry.task.project}/tasks/${entry.task.id}/overlays/stamp`,
+        contentType: "application/json"
+      }).done(result => {
+        if (result.stamp){
+          this.serverStamp = result.stamp;
+          this.clientStamp = new Date().getTime();
+          this.patchOverlay(entry, extra); // Resume
+        }else{
+          console.warn(result);
+        }
+      }).fail(() => {
+        this.setState({error: interpolate(_("Cannot save overlay %(name)s"), {name: entry.name})});
+      });
+
+      return;
+    }
+
+    $.ajax({
+      url: this.overlayUrl(entry, entry.storageId),
+      type: 'PATCH',
+      contentType: 'application/json',
+      data: JSON.stringify(Object.assign({
+        stamp: this.serverStamp + (new Date().getTime() - this.clientStamp),
+        name: entry.name,
+        meta: this.overlayMeta(entry)
+      }, extra))
+    }).done(result => {
+      if (!result.updated) console.warn(result);
+    }).fail(() => {
+      this.setState({error: interpolate(_("Cannot save overlay %(name)s"), {name: entry.name})});
+    });
+  }
+
+  loadStoredOverlays = () => {
+    const seen = {};
+
+    this.props.tiles.forEach(tile => {
+      const task = tile.meta.task;
+      if (seen[task.id]) return;
+      seen[task.id] = true;
+
+      (task.overlays || []).forEach(item => {
+        const placeholder = {
+          id: `overlay-load-${item.id}`,
+          name: item.name || _("Overlay"),
+          loading: true,
+          progress: 0,
+          converting: false,
+          opacity: 100,
+          bounds: null,
+          children: []
+        };
+        this.assignOverlayTask(placeholder, task);
+        this.setState(update(this.state, {
+          userOverlays: {$push: [placeholder]}
+        }));
+
+        const removePlaceholder = () => {
+          this.setState({userOverlays: this.state.userOverlays.filter(o => o !== placeholder)});
+        };
+
+        $.ajax({
+          url: `/api/projects/${task.project}/tasks/${task.id}/overlays/${item.id}.geojson`,
+          dataType: 'json',
+          xhr: () => {
+            const xhr = $.ajaxSettings.xhr();
+            xhr.addEventListener('progress', e => {
+              if (e.lengthComputable){
+                placeholder.progress = e.loaded / e.total * 100;
+                this.setState({userOverlays: this.state.userOverlays.slice()});
+              }
+            }, false);
+            return xhr;
+          }
+        }).done(geojson => {
+          const idx = this.state.userOverlays.indexOf(placeholder);
+          if (idx === -1) return; // Removed in the meantime
+
+          if (!geojson || geojson.type !== "FeatureCollection"){
+            removePlaceholder();
+            return;
+          }
+
+          const meta = item.meta || {};
+          const entry = buildOverlay(geojson, item.name || _("Overlay"), {
+            colors: meta.colors || {},
+            opacity: meta.opacity,
+            visible: meta.visible,
+            hidden: meta.hidden
+          });
+          entry.storageId = item.id;
+          entry.stored = true;
+          this.assignOverlayTask(entry, task);
+          this.setOverlaySync(entry);
+          if (entry.visible){
+            entry.children.forEach(c => { if (c.visible) c.layer.addTo(this.map); });
+          }
+          this.setState(update(this.state, {
+            userOverlays: {$splice: [[idx, 1, entry]]}
+          }));
+        }).fail(removePlaceholder);
+      });
+    });
+  }
+
+  handleDxfDrop = file => {
+    if (!this.checkOverlayTask()) return;
+
+    // One DXF import at a time
+    if (this.pendingDxfFile) return;
+
+    this.pendingDxfFile = file;
+    this.pendingDxfTask = this.getNearestTask();
+    if (this.dxfDialog) this.dxfDialog.show();
+  }
+
+  handleDxfDialogShow = () => {
+    if (this.dxfEpsgInput){
+      const task = this.pendingDxfTask;
+      this.dxfEpsgInput.value = (task && task.epsg) ? task.epsg : "";
+      this.dxfEpsgInput.focus();
+    }
+  }
+
+  handleDxfDialogHide = () => {
+    this.pendingDxfFile = null;
+    this.pendingDxfTask = null;
+  }
+
+  handleDxfImport = formData => {
+    const file = this.pendingDxfFile;
+    const task = this.pendingDxfTask;
+    if (!file || !task) return null;
+
+    const epsg = parseInt(formData.epsg);
+    if (isNaN(epsg)){
+      return $.Deferred().reject({message: _("Invalid EPSG code")}).promise();
+    }
+
+    this.pendingDxfFile = null;
+    this.pendingDxfTask = null;
+    this.uploadOverlay(file, epsg, task);
+    return null;
+  }
+
+  uploadOverlay = (file, epsg, task) => {
+    const entry = {
+      id: `overlay-upload-${++this.overlayUploadCount}`,
+      name: file.name.replace(/\.[^/.]+$/, ""),
+      loading: true,
+      progress: 0,
+      converting: false,
+      opacity: 100,
+      bounds: null,
+      children: []
+    };
+    this.assignOverlayTask(entry, task);
+
+    this.setState(update(this.state, {
+      userOverlays: {$push: [entry]}
+    }));
+
+    // Show the upload progress in the layer list
+    if (this.layersControl) this.layersControl.openPanel();
+
+    const formData = new FormData();
+    formData.append("file", file);
+    if (epsg !== null && epsg !== undefined) formData.append("epsg", epsg);
+
+    $.ajax({
+        url: `/api/projects/${task.project}/tasks/${task.id}/overlays/convert`,
+        contentType: false,
+        processData: false,
+        data: formData,
+        type: 'POST',
+        xhr: () => {
+          const xhr = $.ajaxSettings.xhr();
+          if (xhr.upload){
+            xhr.upload.addEventListener('progress', e => {
+              if (e.lengthComputable){
+                entry.progress = e.loaded / e.total * 100;
+                if (entry.progress >= 100) entry.converting = true;
+                this.setState({userOverlays: this.state.userOverlays.slice()});
+              }
+            }, false);
+          }
+          return xhr;
+        }
+    }).done(geojson => {
+        const idx = this.state.userOverlays.indexOf(entry);
+        if (idx === -1) return; // Removed in the meantime
+
+        if (geojson && geojson.type === "FeatureCollection"){
+          const newEntry = buildOverlay(geojson, file.name);
+          newEntry.task = entry.task;
+          newEntry.group = entry.group;
+          newEntry.children.forEach(c => c.layer.addTo(this.map));
+          this.setState(update(this.state, {
+            userOverlays: {$splice: [[idx, 1, newEntry]]}
+          }));
+          if (newEntry.bounds && newEntry.bounds.isValid()) this.map.fitBounds(newEntry.bounds);
+          this.storeOverlay(newEntry, geojson);
+        }else{
+          this.setState({userOverlays: this.state.userOverlays.filter(o => o !== entry),
+                         error: interpolate(_("Cannot convert %(file)s"), {file: file.name})});
+        }
+    }).fail(xhr => {
+        let error;
+        const rj = xhr.responseJSON;
+        if (rj){
+          if (Array.isArray(rj)) error = rj.join(" ");
+          else error = rj.error || rj.detail;
+        }
+        if (!error) error = interpolate(_("Cannot convert %(file)s"), {file: file.name});
+        this.setState({userOverlays: this.state.userOverlays.filter(o => o !== entry), error});
+    });
+  }
+
+  removeUserOverlay = (entry, child) => {
+    // Remove a single sublayer, unless it's the last one
+    if (child && entry.children.length > 1){
+      this.map.removeLayer(child.layer);
+      entry.children = entry.children.filter(c => c !== child);
+      recomputeOverlayBounds(entry);
+      this.setState({userOverlays: this.state.userOverlays.slice()});
+      if (entry.storageId) this.patchOverlay(entry, {removeLayer: child.name});
+      return;
+    }
+
+    entry.children.forEach(c => this.map.removeLayer(c.layer));
+    this.setState({userOverlays: this.state.userOverlays.filter(o => o !== entry)});
+    if (entry.storageId && entry.task && this.canEditTask()){
+      $.ajax({
+        url: this.overlayUrl(entry, entry.storageId),
+        type: 'DELETE'
+      });
+    }
+  }
+
   layerVisibilityCheck = () => {
     // Check if imageryLayers are invisible and remove them to prevent tiles from loading
     this.state.imageryLayers.forEach(layer => {
@@ -1025,13 +1507,14 @@ _('Example:'),
 
     if (this.layersControl && (prevState.imageryLayers !== this.state.imageryLayers ||
                             prevState.overlays !== this.state.overlays ||
-                            prevState.annotations !== this.state.annotations)){
+                            prevState.annotations !== this.state.annotations ||
+                            prevState.userOverlays !== this.state.userOverlays)){
       this.updateLayersControl();
     }
   }
 
   updateLayersControl = () => {
-    this.layersControl.update(this.state.imageryLayers, this.state.overlays, this.state.annotations);
+    this.layersControl.update(this.state.imageryLayers, this.state.overlays, this.state.annotations, this.state.userOverlays);
   }
 
   componentWillUnmount() {
@@ -1055,6 +1538,188 @@ _('Example:'),
     if (this.shareButton) this.shareButton.hidePopup();
   }
 
+  openVideoWithFlightPath = (basePath, media, marker, mediaLayer) => {
+    if (marker._flightPathLoading) return;
+    marker._flightPathLoading = true;
+
+    const flightPathUrl = `${basePath}/video/${encodeURIComponent(media.filename)}/flightpath.geojson`;
+
+    const markerLatLng = marker.getLatLng();
+    const spinnerIcon = L.divIcon({
+      className: 'video-marker-spinner',
+      html: '<i class="fa fa-circle-notch fa-spin"></i>',
+      iconSize: [41, 46],
+      iconAnchor: [15, 44]
+    });
+    const spinnerMarker = L.marker(markerLatLng, { icon: spinnerIcon }).addTo(this.map);
+
+    const onFlightPathLoaded = (feature) => {
+      if (!feature || !feature.geometry || !feature.geometry.coordinates || feature.geometry.coordinates.length < 2) {
+        return;
+      }
+      marker._flightPathFeature = feature; // cache
+      mediaLayer.removeMarker(marker);
+
+      const coords = feature.geometry.coordinates;
+      const timestamps = feature.properties.timestamps;
+      const latLngs = coords.map(c => [c[1], c[0]]);
+
+      const flightPathLine = L.polyline(latLngs, {
+        color: '#4A90D9',
+        weight: 4,
+        opacity: 0.8
+      }).addTo(this.map);
+
+      const startDot = L.circleMarker(latLngs[0], {
+        radius: 8,
+        color: '#fff',
+        weight: 2,
+        fillColor: '#2ECC71',
+        fillOpacity: 1
+      }).addTo(this.map);
+
+      const endDot = L.circleMarker(latLngs[latLngs.length - 1], {
+        radius: 8,
+        color: '#fff',
+        weight: 2,
+        fillColor: '#E74C3C',
+        fillOpacity: 1
+      }).addTo(this.map);
+
+      const positionDot = L.circleMarker(latLngs[0], {
+        radius: 8,
+        color: '#fff',
+        weight: 2,
+        fillColor: '#FF9E67',
+        fillOpacity: 1
+      }).addTo(this.map);
+
+      const mapEl = this.container.parentElement;
+      const mapHeight = mapEl ? mapEl.clientHeight : 0;
+      this.map.fitBounds(flightPathLine.getBounds(), {
+        paddingTopLeft: [50, mapHeight / 2 + 50],
+        paddingBottomRight: [50, 50]
+      });
+
+      const getPositionAtTime = (currentTime) => {
+        if (!timestamps || timestamps.length < 2) return latLngs[0];
+        if (currentTime <= timestamps[0]) return latLngs[0];
+        if (currentTime >= timestamps[timestamps.length - 1]) return latLngs[latLngs.length - 1];
+
+        for (let i = 1; i < timestamps.length; i++) {
+          if (currentTime <= timestamps[i]) {
+            const t0 = timestamps[i - 1];
+            const t1 = timestamps[i];
+            const frac = (currentTime - t0) / (t1 - t0);
+            const lat = latLngs[i - 1][0] + frac * (latLngs[i][0] - latLngs[i - 1][0]);
+            const lng = latLngs[i - 1][1] + frac * (latLngs[i][1] - latLngs[i - 1][1]);
+            return [lat, lng];
+          }
+        }
+        return latLngs[latLngs.length - 1];
+      };
+
+      const getTimeAtPoint = (latlng) => {
+        if (!timestamps || timestamps.length < 2) return 0;
+
+        let bestDist = Infinity;
+        let bestTime = 0;
+
+        for (let i = 1; i < latLngs.length; i++) {
+          const ax = latLngs[i - 1][1], ay = latLngs[i - 1][0];
+          const bx = latLngs[i][1], by = latLngs[i][0];
+          const px = latlng.lng, py = latlng.lat;
+
+          const dx = bx - ax, dy = by - ay;
+          const lenSq = dx * dx + dy * dy;
+          let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+          t = Math.max(0, Math.min(1, t));
+
+          const cx = ax + t * dx, cy = ay + t * dy;
+          const dist = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestTime = timestamps[i - 1] + t * (timestamps[i] - timestamps[i - 1]);
+          }
+        }
+        return bestTime;
+      };
+
+      let videoEl = null;
+      let animFrameId = null;
+
+      flightPathLine.on('click', (e) => {
+        if (videoEl) {
+          L.DomEvent.stopPropagation(e);
+          videoEl.currentTime = getTimeAtPoint(e.latlng);
+        }
+      });
+      
+      let cleanupCalled = false;
+      const cleanup = () => {
+        if (cleanupCalled) return;
+        cleanupCalled = true;
+        if (animFrameId) cancelAnimationFrame(animFrameId);
+        this.map.removeLayer(flightPathLine);
+        this.map.removeLayer(startDot);
+        this.map.removeLayer(endDot);
+        this.map.removeLayer(positionDot);
+        mediaLayer.addMarker(marker, this.map);
+        marker._flightPathLoading = false;
+        ReactDOM.unmountComponentAtNode(container);
+        container.remove();
+      };
+
+      const mapContainer = this.container.parentElement;
+      const container = document.createElement('div');
+      ReactDOM.render(<MediaView
+        basePath={basePath}
+        media={media}
+        autoOpen
+        halfScreen
+        mapContainer={mapContainer}
+        onVideoElement={(el) => {
+          videoEl = el;
+          const tick = () => {
+            positionDot.setLatLng(getPositionAtTime(el.currentTime));
+            animFrameId = requestAnimationFrame(tick);
+          };
+          animFrameId = requestAnimationFrame(tick);
+        }}
+        onClose={cleanup}
+      />, container);
+      document.body.appendChild(container);
+    };
+
+    // Check cache
+    if (marker._flightPathFeature){
+      onFlightPathLoaded(marker._flightPathFeature);
+      this.map.removeLayer(spinnerMarker);
+      marker._flightPathLoading = false;
+    }else{
+      $.getJSON(flightPathUrl)
+        .done(onFlightPathLoaded)
+        .fail(() => {
+          const container = document.createElement('div');
+          ReactDOM.render(<MediaView
+            basePath={basePath}
+            media={media}
+            autoOpen
+            onClose={() => {
+              ReactDOM.unmountComponentAtNode(container);
+              container.remove();
+            }}
+          />, container);
+          document.body.appendChild(container);
+        })
+        .always(() => {
+          this.map.removeLayer(spinnerMarker);
+          marker._flightPathLoading = false;
+        });
+    }
+  }
+
   render() {
     return (
       <div style={{height: "100%"}} className="map">
@@ -1062,13 +1727,31 @@ _('Example:'),
 
         <ErrorMessage bind={[this, 'error']} />
         <div className="opacity-slider theme-secondary hidden-xs">
-            <div className="opacity-slider-label">{_("Opacity:")}</div> <input type="range" className="opacity" step="1" value={this.state.opacity} onChange={this.updateOpacity} />
+            <div className="opacity-slider-label" title={_("Opacity")}><i className="fa fa-adjust"></i></div> <input type="range" className="opacity" step="1" value={this.state.opacity} onChange={this.updateOpacity} />
         </div>
 
-        <Standby 
+        <Standby
             message={_("Loading...")}
             show={this.state.showLoading}
             />
+
+        <FormDialog
+            ref={(domNode) => { this.dxfDialog = domNode; }}
+            title={_("Import DXF")}
+            saveLabel={_("Import")}
+            savingLabel={_("Importing...")}
+            saveIcon="fa fa-file-import"
+            getFormData={() => ({epsg: this.dxfEpsgInput ? this.dxfEpsgInput.value : ""})}
+            saveAction={this.handleDxfImport}
+            onShow={this.handleDxfDialogShow}
+            onHide={this.handleDxfDialogHide}>
+          <div className="form-group">
+            <label className="col-sm-3 control-label">EPSG:</label>
+            <div className="col-sm-9">
+              <input type="number" className="form-control" ref={(domNode) => { this.dxfEpsgInput = domNode; }} placeholder="32617" />
+            </div>
+          </div>
+        </FormDialog>
             
         <div 
           style={{height: "100%"}}

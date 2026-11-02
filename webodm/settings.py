@@ -2,7 +2,6 @@ import os, sys, json
 
 import datetime
 
-import tzlocal
 from django.contrib.messages import constants as messages
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
@@ -56,6 +55,10 @@ APP_DEFAULT_LOGO = os.path.join('app', 'static', 'app', 'img', 'logo512.png')
 # In single user mode, a default admin account is created and automatically
 # used so that no login windows are displayed
 SINGLE_USER_MODE = False
+
+# Enable a mechanism to override DNS resolution
+# in cases where the machine might have a misconfigured DNS
+DNS_RESOLUTION_FALLBACK = None # ['8.8.8.8', '1.1.1.1'] # Google, Cloudflare
 
 # URL to redirect to if there are no processing nodes when visiting the dashboard
 PROCESSING_NODES_ONBOARDING = None
@@ -166,7 +169,7 @@ AUTHENTICATION_BACKENDS = (
 # https://docs.djangoproject.com/en/1.10/topics/i18n/
 
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = tzlocal.get_localzone().zone
+TIME_ZONE = 'Etc/UTC'
 USE_I18N = True
 USE_L10N = True
 USE_TZ = True
@@ -265,6 +268,7 @@ if TESTING:
     MEDIA_ROOT = os.path.join(BASE_DIR, 'app', 'media_test')
 MEDIA_TMP = os.path.join(MEDIA_ROOT, 'tmp')
 MEDIA_CACHE = os.path.join(MEDIA_ROOT, 'CACHE')
+MEDIA_GRIDS = os.path.join(MEDIA_ROOT, 'grids')
 
 FILE_UPLOAD_TEMP_DIR = MEDIA_TMP
 
@@ -319,6 +323,7 @@ REST_FRAMEWORK = {
 
 JWT_AUTH = {
     'JWT_EXPIRATION_DELTA': datetime.timedelta(hours=6),
+    'JWT_ALLOW_REFRESH': True,
 }
 
 # Celery
@@ -356,8 +361,37 @@ NODE_OFFLINE_MINUTES = 5
 # and assumes that all nodes are always online, avoiding polling
 NODE_OPTIMISTIC_MODE = False
 
+# Number of parallel connections for uploading/downloading to/from processing nodes
+NODE_CONNECTIONS = 6
+
 # URL to external auth endpoint
 EXTERNAL_AUTH_ENDPOINT = ''
+
+# OpenID Connect (OIDC) authentication
+OIDC_AUTH_PROVIDERS = []
+
+# OpenID Connect (IODC) list of authorized e-mails
+# when set, rejects any user who's email does not match an entry (domain-wide matches supported)
+# e.g. ["@myorg.com", "exactuser@otherorg.com"]
+OIDC_AUTH_EMAILS = None
+
+# When turned on, updates the user's profile information in WebODM from OIDC profile data
+# Will additionally request the "profile" OIDC scope
+OIDC_UPDATE_PROFILE = False
+
+# List any custom OIDC scopes needed for custom claims
+OIDC_CUSTOM_SCOPES = []
+
+# OIDC Claims to check for automatic group assignments
+# List the names of the OIDC claims to check, the values returned in those claims should
+# be the names of the groups to be assigned
+OIDC_GROUPS_CLAIMS = []
+
+# Create any groups returned in the claims listed in OIDC_GROUPS_CLAIMS that don't exist
+OIDC_CREATE_GROUPS = False
+
+# List any manually managed groups other than 'Default' that you don't want OIDC users removed from
+OIDC_IGNORE_GROUPS = []
 
 # Enable cluster mode for this instance by setting an integer ID >= 1
 CLUSTER_ID = None
@@ -368,6 +402,9 @@ CLUSTER_URL = ''
 
 # URL to a page where a user can reset the password
 RESET_PASSWORD_LINK = ''
+
+# Additional HTML code to add at the bottom of pages
+HTML_AFTER_BODY = ''
 
 # Number of hours before tasks are automatically deleted
 # from an account that is exceeding a disk quota
@@ -398,13 +435,19 @@ WORKERS_MAX_TIME_LIMIT = None
 AUTO_LOGIN_USER = None
 
 # Link to GCP docs
-GCP_DOCS_LINK = "https://docs.opendronemap.org/gcp/#gcp-file-format"
+GCP_DOCS_LINK = "https://docs.webodm.org/ground-control-points/#gcp-file-format"
 
 # Link to general docs
-DOCS_LINK = "https://docs.opendronemap.org"
+DOCS_LINK = "https://docs.webodm.org"
+
+# Link to Splat docs
+SPLAT_DOCS_LINK = "https://docs.webodm.org/gaussian-splats/#software"
 
 # Link to task options docs
-TASK_OPTIONS_DOCS_LINK = "https://docs.opendronemap.org/arguments/"
+TASK_OPTIONS_DOCS_LINK = ""
+
+# Whether to show deprecation messages
+DEPRECATION_WARNINGS = True
 
 # Whether to display onboarding instructions and 
 # automatically create a first project on first login

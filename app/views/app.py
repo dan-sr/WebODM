@@ -8,9 +8,10 @@ from django.shortcuts import render, redirect, get_object_or_404
 from guardian.shortcuts import get_objects_for_user
 
 from nodeodm.models import ProcessingNode
-from app.models import Project, Task
+from app.models import Project, Task, Basemap
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.utils.html import format_html
 from django.utils.translation import ugettext as _
 from django import forms
 from app.views.utils import get_permissions, get_project_or_raise, get_task_or_raise, handle_302, ResponseClusterRedirect, cluster_mode
@@ -61,7 +62,8 @@ def dashboard(request):
         'no_tasks': no_tasks,
         'onboarding': settings.DASHBOARD_ONBOARDING,
         'params': {
-            'permissions': json.dumps(permissions)
+            'permissions': json.dumps(permissions),
+            'basemaps': json.dumps(Basemap.get_cached_basemaps())
         }.items()
     })
 
@@ -92,9 +94,10 @@ def map(request, project_pk=None, task_pk=None):
                 'map-items': json.dumps(mapItems),
                 'title': title,
                 'public': 'false',
-                'share-buttons': 'false' if settings.DESKTOP_MODE else 'true',
+                'share-buttons': 'true',
                 'permissions': json.dumps(get_permissions(request.user, project)),
                 'project': json.dumps(projectInfo),
+                'basemaps': json.dumps(Basemap.get_cached_basemaps()),
             }.items()
         })
 
@@ -119,8 +122,10 @@ def model_display(request, project_pk=None, task_pk=None):
             'title': title,
             'params': {
                 'task': json.dumps(task.get_model_display_params()),
+                'title': title,
                 'public': 'false',
-                'share-buttons': 'false' if settings.DESKTOP_MODE else 'true'
+                'share-buttons': 'true',
+                'model-type': request.GET.get('t', 'cloud'),
             }.items()
         })
 
@@ -130,6 +135,12 @@ def about(request):
 @login_required
 def processing_node(request, processing_node_id):
     pn = get_object_or_404(ProcessingNode, pk=processing_node_id)
+    
+    if settings.DEPRECATION_WARNINGS and pn.engine is not None and pn.engine == 'odm':
+        messages.add_message(request, messages.constants.WARNING, format_html(
+            _('%(node)s is deprecated might stop working in a future version. See the %(link_start)s migration guide %(link_end)s to upgrade.' % {'node': pn, 'link_start': '<a href="https://docs.webodm.org/tutorials/opendronemap-migration-guide/" target="_blank">', 'link_end': '</a>'}),
+        ))
+
     if not pn.update_node_info():
         messages.add_message(request, messages.constants.WARNING, _('%(node)s seems to be offline.') % {'node': pn})
 

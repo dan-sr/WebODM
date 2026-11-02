@@ -29,6 +29,7 @@ class EditTaskForm extends React.Component {
       task: PropTypes.object,
       suggestedTaskName: PropTypes.oneOfType([PropTypes.string, PropTypes.func]),
       getCropPolygon: PropTypes.func,
+      getExifData: PropTypes.func,
       getGcpFile: PropTypes.func
   };
 
@@ -110,13 +111,13 @@ class EditTaskForm extends React.Component {
       return null;
   }
 
-  loadProcessingNodes(){
+  loadProcessingNodes(refresh = false){
     const failed = () => {
       this.setState({error: _("Could not load list of processing nodes. Are you connected to the internet?")});
     }
 
     this.nodesRequest = 
-      $.getJSON("/api/processingnodes/?has_available_options=True", json => {
+      $.getJSON("/api/processingnodes/?has_available_options=True" + (refresh ? "&refresh=True" : ""), json => {
         if (Array.isArray(json)){
           // No nodes with options?
           const noProcessingNodesError = (nodes) => {
@@ -187,7 +188,7 @@ class EditTaskForm extends React.Component {
 
   retryLoad(){
     this.setState({error: ""});
-    this.loadProcessingNodes();
+    this.loadProcessingNodes(true);
     this.loadPresets();
   }
 
@@ -633,6 +634,8 @@ class EditTaskForm extends React.Component {
 
           {this.state.editingPreset ? 
             <EditPresetDialog
+              task={this.props.task}
+              getExifData={this.props.getExifData}
               preset={this.state.selectedPreset}
               availableOptions={this.state.selectedNode.options}
               onHide={this.handleCancelEditPreset}

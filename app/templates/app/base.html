@@ -131,6 +131,8 @@
 window.__taskOptionsDocsLink = "{{ to_link|safe }}";
 {% gcp_docs_link as gcp_link %}
 window.__gcpDocsLink = "{{ gcp_link|safe }}";
+{% splat_docs_link as splat_link %}
+window.__splatDocsLink = "{{ splat_link|safe }}";
 window.__loggedUser = "{{ user.username }}";
 
 $(function(){
@@ -178,4 +180,5 @@ $(function(){
 </script>
 <script src="{% static 'app/js/vendor/bootstrap.min.js' %}"></script>
 {{ SETTINGS.theme.html_after_body|safe }}
+{% html_after_body as code %}{{ code|safe }}
 </html>

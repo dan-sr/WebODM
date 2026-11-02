@@ -12,6 +12,7 @@ import SortPanel from './SortPanel';
 import Dropzone from '../vendor/dropzone';
 import csrf from '../django/csrf';
 import HistoryNav from '../classes/HistoryNav';
+import Storage from '../classes/Storage';
 import PropTypes from 'prop-types';
 import ResizeModes from '../classes/ResizeModes';
 import Tags from '../classes/Tags';
@@ -20,12 +21,16 @@ import { _, interpolate } from '../classes/gettext';
 import $ from 'jquery';
 
 class ProjectListItem extends React.Component {
+  static defaultProps = {
+    basemaps: []
+  }
   static propTypes = {
       history: PropTypes.object.isRequired,
       data: PropTypes.object.isRequired, // project json
       onDelete: PropTypes.func,
       onTaskMoved: PropTypes.func,
-      onProjectDuplicated: PropTypes.func
+      onProjectDuplicated: PropTypes.func,
+      basemaps: PropTypes.array
   }
 
   constructor(props){
@@ -43,7 +48,7 @@ class ProjectListItem extends React.Component {
       importingExternal: false,
       buttons: [],
       importItems: [],
-      sortKey: "-created_at",
+      sortKey: Storage.getItem("task_ordering") || "-created_at",
       filterTags: [],
       selectedTags: [],
       filterText: ""
@@ -94,6 +99,7 @@ class ProjectListItem extends React.Component {
   componentWillUnmount(){
     if (this.deleteProjectRequest) this.deleteProjectRequest.abort();
     if (this.refreshRequest) this.refreshRequest.abort();
+    if (this.checkQueueCompletedOnTabActivation) document.removeEventListener("visibilitychange", this.checkQueueCompletedOnTabActivation);
   }
 
   componentDidUpdate(prevProps, prevState){
@@ -114,7 +120,8 @@ class ProjectListItem extends React.Component {
       uploadedCount: 0,
       totalBytes: 0,
       totalBytesSent: 0,
-      lastUpdated: 0
+      lastUpdated: 0,
+      serverTimeouts: 0
     };
   }
 
@@ -138,26 +145,87 @@ class ProjectListItem extends React.Component {
     Dropzone.autoDiscover = false;
 
     if (this.hasPermission("add")){
+      const unstableConnection = !!Storage.getItem("unstable_connection");
+
       this.dz = new Dropzone(this.dropzone, {
           paramName: "images",
           url : 'TO_BE_CHANGED',
-          parallelUploads: 4,
+          parallelUploads: unstableConnection ? 1 : 6,
           uploadMultiple: false,
-          acceptedFiles: "image/*,text/plain,.las,.laz,video/*,.srt,.dng,.nef",
+          acceptedFiles: "image/*,text/plain,.las,.laz,video/*,.srt,.dng,.nef,.gpx",
           autoProcessQueue: false,
           createImageThumbnails: false,
           clickable: this.uploadButton,
           maxFilesize: 131072, // 128G
           timeout: 2147483647,
           chunking: true,
-          chunkSize: 8000000, // 8MB,
+          chunkSize: unstableConnection ? 1000000 : 8000000, // 8MB,
           retryChunks: true,
           retryChunksLimit: 20,
+          serverTimeoutCallback: () => {
+            if (!unstableConnection && this.state.upload.uploading && this.state.upload.progress < 100.0){
+              this.setUploadState({serverTimeouts: this.state.upload.serverTimeouts + 1});
+            }
+          },
           
           headers: {
             [csrf.header]: csrf.token
           }
       });
+
+      const checkQueueCompleted = () => {
+        // Prevent double calls to /commit
+        if (this.checkTimeout){
+          clearTimeout(this.checkTimeout);
+          this.checkTimeout = null;
+        }
+        this.checkTimeout = setTimeout(() => {
+          const remainingFilesCount = this.state.upload.totalCount - this.state.upload.uploadedCount;
+          if (remainingFilesCount === 0 && this.state.upload.uploadedCount > 0 && this.state.upload.uploading){
+            // All files have uploaded!
+            const COMMIT_RETRIES = 20;
+
+            const commitUploads = (attempt) => {
+              const retryCommit = () => {
+                if (attempt < COMMIT_RETRIES){
+                  console.warn(`Commit failed, retrying... (${attempt})`);
+                  setTimeout(() => {
+                    if (this.state.upload.uploading){
+                      commitUploads(attempt + 1);
+                    }
+                  }, 2500 * attempt);
+                }else{
+                  this.setUploadState({uploading: false, error: _("Cannot create new task. Please try again later.")});
+                }
+              };
+
+              $.ajax({
+                  url: `/api/projects/${this.state.data.id}/tasks/${this.dz._taskInfo.id}/commit/`,
+                  contentType: 'application/json',
+                  dataType: 'json',
+                  type: 'POST',
+                  timeout: 15000,
+                }).done((task) => {
+                  if (task && task.id){
+                      this.setUploadState({uploading: false});
+                      this.newTaskAdded();
+                  }else{
+                    retryCommit();
+                  }
+                }).fail(() => {
+                  retryCommit();
+                });
+            };
+            commitUploads(0);
+          }else if (this.dz.getQueuedFiles() === 0){
+              // Done but didn't upload all?
+              this.setUploadState({
+                  uploading: false,
+                  error: interpolate(_('%(count)s files cannot be uploaded. As a reminder, only images (.jpg, .tif, .png) and GCP files (.txt) can be uploaded. Try again.'), { count: remainingFilesCount })
+              });
+          }
+        }, 250);
+      };
 
       this.dz.on("addedfiles", files => {
           let totalBytes = 0;
@@ -223,12 +291,16 @@ class ProjectListItem extends React.Component {
                 });
 
                 file.deltaBytesSent = bytesSent;
+
+                if (this.state.upload.progress === 100){
+                  checkQueueCompleted();
+                }
             }
         })
         .on("complete", (file) => {
             // Retry
             const retry = () => {
-                const MAX_RETRIES = 20;
+                const MAX_RETRIES = 30;
 
                 if (!file.accepted){
                   throw new Error(interpolate(_('%(filename)s is not a valid file'), {filename: file.name }));
@@ -248,9 +320,17 @@ class ProjectListItem extends React.Component {
                     file.deltaBytesSent = 0;
                     file.trackedBytesSent = 0;
                     file.retries++;
+                    
+                    const retryTime = 2500 * file.retries;
+
+                    // Update serverTimeout so that its at lest 3x retryTime
+                    // otherwise a file waiting to be retried could trigger 
+                    // a serverTimeout
+                    this.dz.options.serverTimeout = Math.max(this.dz.options.serverTimeout, 3 * retryTime);
+
                     setTimeout(() => {
                       this.dz.processQueue();
-                    }, 5000 * file.retries);
+                    }, retryTime);
                 }else{
                     throw new Error(interpolate(_('Cannot upload %(filename)s, exceeded max retries (%(max_retries)s)'), {filename: file.name, max_retries: MAX_RETRIES}));
                 }
@@ -282,8 +362,11 @@ class ProjectListItem extends React.Component {
                         this.setUploadState({
                             progress,
                             totalBytesSent,
-                            uploadedCount: this.state.upload.uploadedCount + 1
+                            uploadedCount: this.state.upload.uploadedCount + 1,
+                            serverTimeouts: 0
                         });
+
+                        checkQueueCompleted();
                       }else{
                         // Chunk success, wait for end
                       }
@@ -304,52 +387,6 @@ class ProjectListItem extends React.Component {
                 if (this.dz.files.length) this.dz.cancelUpload();
             }
         })
-        .on("queuecomplete", () => {
-            const remainingFilesCount = this.state.upload.totalCount - this.state.upload.uploadedCount;
-            if (remainingFilesCount === 0 && this.state.upload.uploadedCount > 0){
-                // All files have uploaded!
-                const COMMIT_RETRIES = 10;
-
-                const commitUploads = (attempt) => {
-                  const retryCommit = () => {
-                    if (attempt < COMMIT_RETRIES){
-                      console.warn(`Commit failed, retrying... (${attempt})`);
-                      setTimeout(() => {
-                        if (this.state.upload.uploading){
-                          commitUploads(attempt + 1);
-                        }
-                      }, 5000 * attempt);
-                    }else{
-                      this.setUploadState({uploading: false, error: _("Cannot create new task. Please try again later.")});
-                    }
-                  };
-
-                  $.ajax({
-                      url: `/api/projects/${this.state.data.id}/tasks/${this.dz._taskInfo.id}/commit/`,
-                      contentType: 'application/json',
-                      dataType: 'json',
-                      type: 'POST',
-                      timeout: 30000,
-                    }).done((task) => {
-                      if (task && task.id){
-                          this.setUploadState({uploading: false});
-                          this.newTaskAdded();
-                      }else{
-                        retryCommit();
-                      }
-                    }).fail(() => {
-                      retryCommit();
-                    });
-                };
-                commitUploads(0);
-            }else if (this.dz.getQueuedFiles() === 0){
-                // Done but didn't upload all?
-                this.setUploadState({
-                    uploading: false,
-                    error: interpolate(_('%(count)s files cannot be uploaded. As a reminder, only images (.jpg, .tif, .png) and GCP files (.txt) can be uploaded. Try again.'), { count: remainingFilesCount })
-                });
-            }
-        })
         .on("reset", () => {
           this.resetUploadState();
         })
@@ -358,6 +395,13 @@ class ProjectListItem extends React.Component {
             this.resetUploadState();
           }
         });
+
+      this.checkQueueCompletedOnTabActivation = () => {
+        if (document.visibilityState === "visible" && this.state.upload.uploading){
+          checkQueueCompleted();
+        }
+      }
+      document.addEventListener("visibilitychange", this.checkQueueCompletedOnTabActivation);
     }
     
     PluginsAPI.Dashboard.triggerAddNewTaskButton({projectId: this.state.data.id, onNewTaskAdded: this.newTaskAdded}, (button) => {
@@ -407,6 +451,10 @@ class ProjectListItem extends React.Component {
 
   closeUploadError(){
     this.setUploadState({error: ""});
+  }
+
+  resetServerTimeouts = () => {
+    this.setUploadState({serverTimeouts: 0});
   }
 
   cancelUpload(){
@@ -616,6 +664,7 @@ class ProjectListItem extends React.Component {
   sortChanged = key => {
     if (this.taskList){
       this.setState({sortKey: key});
+      Storage.setItem("task_ordering", key);
       setTimeout(() => {
         this.taskList.refresh();
       }, 0);
@@ -668,6 +717,12 @@ class ProjectListItem extends React.Component {
     }
   }
 
+  enableStableMode = () => {
+    Storage.setItem("unstable_connection", "1");
+    this.handleTaskCanceled();
+    location.reload(true);
+  }
+
   render() {
     const { refreshing, data, filterTags } = this.state;
     const numTasks = data.tasks.length;
@@ -675,6 +730,7 @@ class ProjectListItem extends React.Component {
     const userTags = Tags.userTags(data.tags);
     let deleteWarning = _("All tasks, images and models associated with this project will be permanently deleted. Are you sure you want to continue?");
     if (!data.owned) deleteWarning = _("This project was shared with you. It will not be deleted, but simply hidden from your dashboard. Continue?")
+    const ordering = Storage.getItem("task_ordering") || "-created_at";
 
     return (
       <li className={"project-list-item list-group-item " + (refreshing ? "refreshing" : "")}
@@ -794,7 +850,7 @@ class ProjectListItem extends React.Component {
                   <a href="javascript:void(0);" className="dropdown-toggle" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
                     {_("Sort")}
                   </a>
-                  <SortPanel selected="-created_at" items={this.sortItems} onChange={this.sortChanged} />
+                  <SortPanel selected={ordering} items={this.sortItems} onChange={this.sortChanged} />
                 </div>
               </div> : ""}
 
@@ -821,6 +877,17 @@ class ProjectListItem extends React.Component {
         </div>
         <i className="drag-drop-icon fa fa-inbox"></i>
         <div className="row">
+          {this.state.upload.uploading && this.state.upload.serverTimeouts >= 5 ? 
+            <div className="alert alert-warning alert-dismissible">
+              <button type="button" className="close" title={_("Close")} onClick={this.resetServerTimeouts}><span aria-hidden="true">&times;</span></button>
+              <i className="fa fa-exclamation-triangle"></i> {_("Unstable connection detected. If the upload gets stuck, press the button below to enable stable mode. You will then need to restart the upload.")}
+              <button style={{display: "block", marginTop: 16}} type="button" className="btn btn-primary btn-sm" 
+                onClick={this.enableStableMode}
+              ><i className="fa fa-plug"></i> {_("Enable Stable Mode")}
+              </button>
+            </div>
+          : ""}
+
           {this.state.upload.uploading ? <UploadProgressBar {...this.state.upload}/> : ""}
           
           {this.state.upload.error !== "" ? 
@@ -840,6 +907,7 @@ class ProjectListItem extends React.Component {
               showAlign={numTasks > 0}
               projectId={this.state.data.id}
               getFiles={() => this.state.upload.files }
+              basemaps={this.props.basemaps}
             />
           : ""}
 

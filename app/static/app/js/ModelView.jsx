@@ -72,41 +72,6 @@ class SetCameraView extends React.Component{
     }
 }
 
-class TexturedModelMenu extends React.Component{
-    static propTypes = {
-        toggleTexturedModel: PropTypes.func.isRequired,
-        selected: PropTypes.bool
-    }
-
-    static defaultProps = {
-        selected: false
-    }
-
-    constructor(props){
-        super(props);
-
-        this.state = {
-            showTexturedModel: props.selected
-        }
-        
-        // Translation for sidebar.html
-        _("Cameras");
-    }
-
-    handleClick = (e) => {
-        this.setState({showTexturedModel: e.target.checked});
-        this.props.toggleTexturedModel(e);
-    }
-
-    render(){
-        return (<label><input 
-                            type="checkbox" 
-                            checked={this.state.showTexturedModel}
-                            onChange={this.handleClick}
-                        /> {_("Show Model")}</label>);
-    }
-}
-
 class CamerasMenu extends React.Component{
     static propTypes = {
         toggleCameras: PropTypes.func.isRequired,
@@ -119,6 +84,9 @@ class CamerasMenu extends React.Component{
         this.state = {
             showCameras: false
         }
+
+        // Translations
+        _("Cameras");
     }
 
     componentDidMount(){
@@ -164,14 +132,16 @@ class ModelView extends React.Component {
     task: null,
     public: false,
     shareButtons: true,
-    modelType: "cloud"
+    modelType: "cloud",
+    title: ""
   };
 
   static propTypes = {
       task: PropTypes.object.isRequired, // The object should contain two keys: {id: <taskId>, project: <projectId>}
       public: PropTypes.bool, // Is the view being displayed via a shared link?
       shareButtons: PropTypes.bool,
-      modelType: PropTypes.oneOf(['cloud', 'mesh'])
+      modelType: PropTypes.oneOf(['cloud', 'mesh', 'splats']),
+      title: PropTypes.string
   };
 
   constructor(props){
@@ -182,14 +152,20 @@ class ModelView extends React.Component {
       showingTexturedModel: false,
       initializingModel: false,
       texModelLoadProgress: null,
+      showingSplats: false,
+      initializingSplats: false,
+      splatsLoadProgress: null,
       selectedCamera: null,
       modalOpen: false,
+      sidebarOpen: false,
       cameraScale: CAMERA_SCALES[props.task.srs.units] || 1.0,
       pluginActionButtons: []
     };
 
     this.pointCloud = null;
     this.modelReference = null;
+    this.splatsReference = null;
+    this.sparkRenderer = null;
 
     this.cameraMeshes = [];
   }
@@ -216,41 +192,18 @@ class ModelView extends React.Component {
   }
 
   loadGeoreferencingOffset = (cb) => {
-    const geoFile = `${this.assetsPath()}/odm_georeferencing/coords.txt`;
-    const legacyGeoFile = `${this.assetsPath()}/odm_georeferencing/odm_georeferencing_model_geo.txt`;
-    const getGeoOffsetFromUrl = (url) => {
-        $.ajax({
-            url: url,
-            type: 'GET',
-            error: () => {
-                console.warn(`Cannot find ${url} (not georeferenced?)`);
-                cb({x: 0, y: 0});
-            },
-            success: (data) => {
-                const lines = data.split("\n");
-                if (lines.length >= 2){
-                    const [ x, y ] = lines[1].split(" ").map(parseFloat);
-                    cb({x, y});
-                }else{
-                    console.warn(`Malformed georeferencing file: ${data}`);
-                    cb({x: 0, y: 0});
-                }
-            }
-        });
-    };
-
     $.ajax({
-        type: "HEAD",
-        url: legacyGeoFile
-    }).done(() => {
-        // If a legacy georeferencing file is present
-        // we'll use that
-        getGeoOffsetFromUrl(legacyGeoFile);
-    }).fail(() => {
-        getGeoOffsetFromUrl(geoFile);
+        url: `${this.basePath()}/rtc`,
+        type: 'GET',
+        error: () => {
+            console.warn(`Cannot retrieve georeferencing offset (not georeferenced?)`);
+            cb({x: 0, y: 0});
+        },
+        success: (data) => {
+            const [ x, y ] = data.coords;
+            cb({x, y});
+        }
     });
-
-    
   }
 
   pointCloudFilePath = (cb) => {
@@ -286,9 +239,13 @@ class ModelView extends React.Component {
     return this.props.task.available_assets.indexOf('shots.geojson') !== -1;
   }
 
+  hasSplats = () => {
+    return this.props.task.available_assets.indexOf('splats.rad') !== -1;
+  }
+
   objFilePath = (cb) => {
     // Mostly for backward compatibility
-    // as newer versions of ODM do not have 
+    // as newer versions of ODX do not have 
     // a odm_textured_model.obj
     const geoUrl = this.texturedModelDirectoryPath() + 'odm_textured_model_geo.obj';
     const nongeoUrl = this.texturedModelDirectoryPath() + 'odm_textured_model.obj';
@@ -314,7 +271,7 @@ class ModelView extends React.Component {
 
   mtlFilename = (cb) => {
     // Mostly for backward compatibility
-    // as newer versions of ODM do not have 
+    // as newer versions of ODX do not have 
     // a odm_textured_model.mtl
     const geoUrl = this.texturedModelDirectoryPath() + 'odm_textured_model_geo.mtl';
 
@@ -348,6 +305,14 @@ class ModelView extends React.Component {
     viewer.setEDLEnabled(true);
     viewer.setFOV(60);
 
+    // Potree signals the sidebar state by setting the "left" offset
+    // of the render area (0px when closed, 300px when open)
+    this.sidebarObserver = new MutationObserver(() => {
+        const sidebarOpen = container.style.left !== "" && container.style.left !== "0px";
+        if (sidebarOpen !== this.state.sidebarOpen) this.setState({sidebarOpen});
+    });
+    this.sidebarObserver.observe(container, {attributes: true, attributeFilter: ['style']});
+
     if (Utils.isIOS()){
         viewer.setPointBudget(1000*1000);
     }else if (Utils.isMobile()){
@@ -372,14 +337,11 @@ class ModelView extends React.Component {
     viewer.loadGUI(() => {
       viewer.setLanguage('en');
       $("#menu_tools").next().show();
-      viewer.toggleSidebar();
 
-      if (this.hasTexturedModel()){
-          window.ReactDOM.render(<TexturedModelMenu selected={this.props.modelType === 'mesh'} toggleTexturedModel={this.toggleTexturedModel}/>, $("#textured_model_button").get(0));
-      }else{
-          $("#textured_model").hide();
-          $("#textured_model_container").hide();
-      }
+    // Don't open sidebar on small screens
+    if (window.innerWidth > 600) {
+        viewer.toggleSidebar();
+    }
 
       if (this.hasCameras()){
           window.ReactDOM.render(<CamerasMenu 
@@ -417,7 +379,9 @@ class ModelView extends React.Component {
 
           // Automatically load 3D model if required
           if (this.hasTexturedModel() && this.props.modelType === "mesh"){
-            this.toggleTexturedModel({ target: { checked: true }});
+            this.toggleTexturedModel(true);
+          }else if (this.hasSplats() && this.props.modelType === "splats"){
+            this.toggleSplats(true);
           }
     
           let scene = viewer.scene;
@@ -560,6 +524,7 @@ class ModelView extends React.Component {
 
   componentWillUnmount(){
     offUnitSystemChanged(this.handleUnitSystemChanged);
+    if (this.sidebarObserver) this.sidebarObserver.disconnect();
     viewer.renderer.domElement.removeEventListener( 'mousedown', this.handleRenderMouseClick );
     viewer.renderer.domElement.removeEventListener( 'mousemove', this.handleRenderMouseMove );
     viewer.renderer.domElement.removeEventListener( 'touchstart', this.handleRenderTouchStart );
@@ -753,10 +718,121 @@ class ModelView extends React.Component {
     );
   }
 
-  toggleTexturedModel = (e) => {
-    const value = e.target.checked;
+  getCurrentModelType = () => {
+    if (this.state.showingTexturedModel || this.state.initializingModel) return "mesh";
+    if (this.state.showingSplats || this.state.initializingSplats) return "splats";
+    return "cloud";
+  }
 
-    if (value){
+  setModelType = (type) => {
+    if (this.state.initializingModel || this.state.initializingSplats) return;
+
+    const current = this.getCurrentModelType();
+    if (current === type) return;
+
+    if (current === "mesh") this.toggleTexturedModel(false);
+    else if (current === "splats") this.toggleSplats(false);
+
+    if (type === "mesh") this.toggleTexturedModel(true);
+    else if (type === "splats") this.toggleSplats(true);
+  }
+
+  loadSplatsModule = (cb) => {
+    if (window.THREEdgs){
+        cb();
+        return;
+    }
+
+    $.ajax({
+        url: "/static/app/js/vendor/threedgs.umd.min.js",
+        dataType: "script",
+        cache: true
+    }).done(() => {
+        if (window.THREEdgs) cb();
+        else cb(new Error(_("Cannot load splats renderer")));
+    }).fail(() => {
+        cb(new Error(_("Cannot load splats renderer")));
+    });
+  }
+
+  initSplatsRenderer = () => {
+    this.sparkRenderer = new THREEdgs.SparkRenderer({renderer: viewer.renderer});
+    viewer.scene.scene.add(this.sparkRenderer);
+  }
+
+  setSplatsVisible = (flag) => {
+    if (this.sparkRenderer) this.sparkRenderer.visible = flag;
+  }
+
+  toggleSplats = (show) => {
+    if (show){
+      // Need to load splats for the first time?
+      if (this.splatsReference === null && !this.state.initializingSplats){
+
+        this.setState({initializingSplats: true, splatsLoadProgress: null});
+
+        this.loadSplatsModule(err => {
+            if (err){
+                this.setState({initializingSplats: false, error: err.message});
+                return;
+            }
+
+            if (!this.sparkRenderer) this.initSplatsRenderer();
+
+            const url = this.assetsPath() + '/splats/model.rad';
+            const splats = new THREEdgs.SplatMesh({
+                url,
+                paged: true,
+                onProgress: e => {
+                    if (e.lengthComputable){
+                        this.setState({splatsLoadProgress: Math.round((e.loaded / e.total) * 100)});
+                    }
+                },
+                onLoad: () => {
+                    this.setState({splatsLoadProgress: null});
+                    this.loadGeoreferencingOffset((offset) => {
+                        splats.translateX(offset.x);
+                        splats.translateY(offset.y);
+
+                        const cropCoords = this.getCropCoordinates();
+                        if (cropCoords){
+                            this.sparkRenderer.cropVertices = cropCoords.map(v => new THREE.Vector2(v.x, v.y));
+                        }
+
+                        viewer.scene.scene.add(splats);
+                        this.splatsReference = splats;
+
+                        this.sparkRenderer.addEventListener("firstDisplay", () => {
+                            this.setPointCloudsVisible(false);
+                            this.setState({
+                                initializingSplats: false,
+                                showingSplats: true
+                            });
+                        });
+                    });
+                }
+            });
+
+            splats.initialized.catch(e => {
+                console.error(e);
+                this.setState({initializingSplats: false, error: _("Could not load splats. This task doesn't seem to have a valid splats file.")});
+            });
+        });
+      }else{
+        // Already initialized
+        this.setSplatsVisible(true);
+        this.setPointCloudsVisible(false);
+        this.setState({showingSplats: true});
+      }
+    }else{
+      this.setSplatsVisible(false);
+      this.setPointCloudsVisible(true);
+      this.setState({showingSplats: false});
+    }
+  }
+
+  toggleTexturedModel = (show) => {
+    if (show){
       // Need to load model for the first time?
       if (this.modelReference === null && !this.state.initializingModel){
 
@@ -835,21 +911,77 @@ class ModelView extends React.Component {
 
   // React render
   render(){
-    const { selectedCamera, showingTexturedModel } = this.state;
+    const { selectedCamera, showingTexturedModel, initializingModel, showingSplats, initializingSplats } = this.state;
     const { task } = this.props;
     const queryParams = {};
     if (showingTexturedModel){
         queryParams.t = "mesh";
+    }else if (showingSplats){
+        queryParams.t = "splats";
     }
 
-    return (<div className="model-view">
+    let modelTypeButtons = [
+      {
+        label: _("Point Cloud"),
+        type: "cloud",
+        icon: "fa fa-pointcloud"
+      }
+    ];
+    if (this.hasTexturedModel()){
+      modelTypeButtons.push({
+        label: _("Textured Model"),
+        type: "mesh",
+        icon: "fab fa-connectdevelop"
+      });
+    }
+    if (this.hasSplats()){
+      modelTypeButtons.push({
+        label: _("Splats"),
+        type: "splats",
+        icon: "fa fa-splat"
+      });
+    }
+
+    // If we have only one type available, hide the buttons
+    if (modelTypeButtons.length === 1) modelTypeButtons = [];
+
+    const selectedModelType = this.getCurrentModelType();
+    const initializing = initializingModel || initializingSplats;
+
+    return (<div className={"model-view " + (this.state.sidebarOpen ? "sidebar-open" : "")}>
           <ErrorMessage bind={[this, "error"]} />
-          <div className="container potree_container" 
-             style={{height: "100%", width: "100%", position: "relative"}}
+
+          {(this.props.title || modelTypeButtons.length > 0) ?
+          <div className="model-view-header">
+            {this.props.title ?
+              <h3 className="model-title" title={this.props.title}><i className="fa fa-cube"></i> {this.props.title}</h3>
+            : ""}
+
+            <div className="model-type-selector btn-group" role="group">
+              {modelTypeButtons.map(modelType =>
+                <button
+                  key={modelType.type}
+                  onClick={() => this.setModelType(modelType.type)}
+                  disabled={initializing}
+                  title={modelType.label}
+                  className={"btn btn-sm " + (modelType.type === selectedModelType ? "btn-primary" : "btn-default")}><i className={modelType.icon + " fa-fw"}></i><span className="hidden-sm hidden-xs"> {modelType.label}</span></button>
+              )}
+            </div>
+          </div>
+          : ""}
+
+          <div className="container potree_container"
+             style={{width: "100%", position: "relative"}}
              onContextMenu={(e) => {e.preventDefault();}}>
-                <div id="potree_render_area" 
+                <div id="potree_render_area"
                     ref={(domNode) => { this.container = domNode; }}></div>
                 <div id="potree_sidebar_container"> </div>
+
+                <Standby
+                  message={initializingSplats ? _("Loading splats...") : _("Loading textured model...")}
+                  show={initializing}
+                  progress={initializingSplats ? this.state.splatsLoadProgress : this.state.texModelLoadProgress}
+                  />
           </div>
 
           <div className={"model-action-buttons " + (this.state.modalOpen ? "modal-open" : "")}>
@@ -881,12 +1013,6 @@ class ModelView extends React.Component {
             <a className="close-thumb" href="javascript:void(0)" onClick={this.closeThumb}><i className="fa fa-window-close"></i></a>
             <ImagePopup feature={selectedCamera._feat} task={task} />
         </div> : ""}
-
-          <Standby 
-            message={_("Loading textured model...")}
-            show={this.state.initializingModel}
-            progress={this.state.texModelLoadProgress}
-            />
       </div>);
   }
 }

@@ -16,7 +16,8 @@ class NewTaskPanel extends React.Component {
     filesCount: 0,
     showResize: false,
     showAlign: false,
-    projectId: null
+    projectId: null,
+    basemaps: []
   };
 
   static propTypes = {
@@ -27,7 +28,8 @@ class NewTaskPanel extends React.Component {
       showAlign: PropTypes.bool,
       getFiles: PropTypes.func,
       projectId: PropTypes.number,
-      suggestedTaskName: PropTypes.oneOfType([PropTypes.string, PropTypes.func])
+      suggestedTaskName: PropTypes.oneOfType([PropTypes.string, PropTypes.func]),
+      basemaps: PropTypes.array
   };
 
   constructor(props){
@@ -174,6 +176,11 @@ class NewTaskPanel extends React.Component {
     return this.mapPreview.getCropPolygon();
   };
 
+  getExifData = () => {
+    if (!this.mapPreview) return [];
+    return this.mapPreview.exifData;
+  };
+
   getGcpFile = () => {
     if (!this.props.getFiles) return null;
 
@@ -270,6 +277,7 @@ class NewTaskPanel extends React.Component {
               getFiles={this.props.getFiles}
               onPolygonChange={this.handlePolygonChange}
               onImagesBboxChanged={this.handleImagesBboxChange}
+              basemaps={this.props.basemaps}
               ref={(domNode) => {this.mapPreview = domNode; }}
             /> : ""}
 
@@ -280,6 +288,7 @@ class NewTaskPanel extends React.Component {
               inReview={this.state.inReview}
               suggestedTaskName={this.handleSuggestedTaskName}
               getCropPolygon={this.getCropPolygon}
+              getExifData={this.getExifData}
               getGcpFile={this.getGcpFile}
               ref={(domNode) => { if (domNode) this.taskForm = domNode; }}
             />

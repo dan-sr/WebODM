@@ -6,6 +6,7 @@ import PresetUtils from '../classes/PresetUtils';
 import PropTypes from 'prop-types';
 import values from 'object.values';
 import { _ } from '../classes/gettext';
+import PluginsAPI from '../classes/plugins/API';
 
 if (!Object.values) {
     values.shim();
@@ -57,7 +58,7 @@ const OPTS_GROUPS = [
     {
         id: 'mvs',
         name: _('Point Cloud'),
-        icon: 'fa fa-braille',
+        icon: 'fa fa-pointcloud',
         subgroups: [
             { id: 'generation', name: _('Generation') },
             { id: 'filtering', name: _('Filtering') },
@@ -134,6 +135,7 @@ const OPTION_GROUP_MAP = {
     'use-fixed-camera-params': { group: 'input', subgroup: 'camera' },
     'rolling-shutter': { group: 'input', subgroup: 'camera' },
     'rolling-shutter-readout': { group: 'input', subgroup: 'camera' },
+    'rolling-shutter-correction': { group: 'input', subgroup: 'camera' },
     'ignore-gsd': { group: 'input', subgroup: 'camera' },
     
     'bg-removal': { group: 'input', subgroup: 'masks' },
@@ -142,14 +144,19 @@ const OPTION_GROUP_MAP = {
     'primary-band': { group: 'input', subgroup: 'multispectral' },
     'radiometric-calibration': { group: 'input', subgroup: 'multispectral' },
     'skip-band-alignment': { group: 'input', subgroup: 'multispectral' },
-
+    'thermal-distance': { group: 'input', subgroup: 'multispectral' },
+    'thermal-humidity': { group: 'input', subgroup: 'multispectral' },
+    'thermal-emissivity': { group: 'input', subgroup: 'multispectral' },
+    'thermal-ambient-temperature': { group: 'input', subgroup: 'multispectral' },
+    'thermal-reflected-temperature': { group: 'input', subgroup: 'multispectral' },
     
     'video-limit': { group: 'input', subgroup: 'video' },
     'video-resolution': { group: 'input', subgroup: 'video' },
     
     // CRS
     'crs': { group: 'crs', subgroup: 'crs-opts' },
-
+    'report-units': { group: 'crs', subgroup: 'crs-opts' },
+    
     // Split/Merge
     'split': { group: 'split-merge', subgroup: 'splitting' },
     'split-overlap': { group: 'split-merge', subgroup: 'splitting' },
@@ -187,6 +194,7 @@ const OPTION_GROUP_MAP = {
     // MVS
     'pc-filter': { group: 'mvs', subgroup: 'filtering' },
     'pc-skip-geometric': { group: 'mvs', subgroup: 'filtering' },
+    'pc-textureless': { group: 'mvs', subgroup: 'filtering' },
     'pc-sample': { group: 'mvs', subgroup: 'filtering' },
     
     'pc-classify': { group: 'mvs', subgroup: 'postprocess' },
@@ -248,6 +256,8 @@ const OPTION_GROUP_MAP = {
 
 class EditPresetDialog extends React.Component {
     static defaultProps = {
+        task: null,
+        getExifData: () => []
     };
 
     static propTypes = {
@@ -255,7 +265,9 @@ class EditPresetDialog extends React.Component {
         availableOptions: PropTypes.array.isRequired,
         saveAction: PropTypes.func.isRequired,
         deleteAction: PropTypes.func.isRequired,
-        onHide: PropTypes.func
+        onHide: PropTypes.func,
+        task: PropTypes.object,
+        getExifData: PropTypes.func
     };
 
     constructor(props){
@@ -277,7 +289,8 @@ class EditPresetDialog extends React.Component {
             showSearch: false,
             collapsedGroups,
             viewMode: 'grouped', // 'grouped' or 'flat',
-            expanded: false
+            expanded: false,
+            pluginControls: {}
         };
 
         this.getFormData = this.getFormData.bind(this);
@@ -285,6 +298,37 @@ class EditPresetDialog extends React.Component {
         this.setOptionRef = this.setOptionRef.bind(this);
         this.getOptions = this.getOptions.bind(this);
         this.isCustomPreset = this.isCustomPreset.bind(this);
+    }
+
+    componentDidMount(){
+        this.triggerPresetDialogOptionsReady();
+    }
+
+    triggerPresetDialogOptionsReady(){
+        const { task, getExifData } = this.props;
+
+        PluginsAPI.Dashboard.triggerPresetDialogOptionsReady({
+            task,
+            getExifData,
+            options: this.options
+        }, result => {
+            if (!result || typeof result !== 'object' || this.unmounted) return;
+
+            const { controls } = result;
+            if (controls && typeof controls === "object"){
+                this.setState(state => {
+                    const pluginControls = Object.assign({}, state.pluginControls);
+                    for (let opt in controls){
+                        pluginControls[opt] = (pluginControls[opt] || []).concat([controls[opt]]);
+                    }
+                    return { pluginControls };
+                });
+            }
+        });
+    }
+
+    componentWillUnmount(){
+        this.unmounted = true;
     }
 
     setOptionRef(optionName){
@@ -362,6 +406,11 @@ class EditPresetDialog extends React.Component {
         if (this.state.showSearch && this.searchControl){
             this.searchControl.focus();
         }
+
+        if (prevState.viewMode !== this.state.viewMode){
+            this.setState({ pluginControls: {} });
+            this.triggerPresetDialogOptionsReady();
+        }
     }
 
     buildOptionsLookup(options) {
@@ -383,6 +432,7 @@ class EditPresetDialog extends React.Component {
             <ProcessingNodeOption 
                 {...option}
                 key={option.name}
+                pluginControls={this.state.pluginControls[option.name]}
                 ref={this.setOptionRef(option.name)} 
             />
         );
