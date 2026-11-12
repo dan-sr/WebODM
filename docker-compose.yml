@@ -6,7 +6,7 @@ volumes:
   appmedia:
 services:
   db:
-    image: webodm/webodm_db
+    image: webodm/webodm_db:18
     container_name: db
     expose:
       - "5432"
